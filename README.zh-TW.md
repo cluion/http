@@ -10,7 +10,7 @@
 npm install @cluion/http
 ```
 
-需要有全域 `fetch` 的環境：現代瀏覽器、Node.js 18+、Bun、Deno。
+需要有全域 `fetch` 的環境：現代瀏覽器、Node.js 22+、Bun、Deno。
 
 ## 快速上手
 
