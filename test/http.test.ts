@@ -6,6 +6,7 @@ import { HttpError, http } from '../src/index'
 // A real local server instead of a mocked fetch:
 // /echo responds with the received method, url, headers and body
 // /reply?status=&type=&body= responds with the given status, Content-Type and body
+// /slow?ms=&stage= waits ms before sending the headers, or before finishing the body when stage=body
 let server: Server
 let base: string
 
@@ -26,6 +27,15 @@ beforeAll(async () => {
             return
         }
 
+        if (url.pathname === '/slow') {
+            if (url.searchParams.get('stage') === 'body') {
+                res.writeHead(200, { 'content-type': 'text/plain' })
+                res.write('partial ')
+            }
+            setTimeout(() => res.end('done'), Number(url.searchParams.get('ms')))
+            return
+        }
+
         res.statusCode = Number(url.searchParams.get('status') ?? 200)
         const type = url.searchParams.get('type')
         if (type) res.setHeader('content-type', type)
@@ -35,7 +45,10 @@ beforeAll(async () => {
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
 })
 
-afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())))
+afterAll(() => new Promise<void>((resolve) => {
+    server.closeAllConnections()
+    server.close(() => resolve())
+}))
 
 const reply = (status: number, type: string, body: string) =>
     http.get(`${base}/reply`, { query: { status, type, body } })
@@ -173,6 +186,28 @@ describe('errors', () => {
 
     it('keeps aborted requests as native AbortError', async () => {
         const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort() }).catch((e) => e)
+        expect(error.name).toBe('AbortError')
+    })
+})
+
+describe('timeout', () => {
+    it('aborts with a native TimeoutError when the headers arrive too late', async () => {
+        const error = await http.get(`${base}/slow`, { query: { ms: 500 }, timeout: 50 }).catch((e) => e)
+        expect(error).toBeInstanceOf(DOMException)
+        expect(error.name).toBe('TimeoutError')
+    })
+
+    it('also covers reading the body', async () => {
+        const error = await http.get(`${base}/slow`, { query: { ms: 500, stage: 'body' }, timeout: 50 }).catch((e) => e)
+        expect(error.name).toBe('TimeoutError')
+    })
+
+    it('resolves normally when the response arrives in time', async () => {
+        expect(await http.get(`${base}/slow`, { query: { ms: 10 }, timeout: 1000 })).toBe('done')
+    })
+
+    it('keeps a user abort as AbortError when a timeout is also set', async () => {
+        const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort(), timeout: 1000 }).catch((e) => e)
         expect(error.name).toBe('AbortError')
     })
 })

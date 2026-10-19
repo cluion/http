@@ -68,6 +68,7 @@ const users = await http.get<User[]>('/users')
 | --- | --- |
 | `query` | 查詢參數物件，見下方規則 |
 | `body` | 只在 `get` / `delete` 使用；`post` / `put` / `patch` 用第二個參數 |
+| `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
 
 ### body 規則
 
@@ -125,10 +126,12 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 const controller = new AbortController()
 
 try {
-    await http.get('/users', { signal: controller.signal })
+    await http.get('/users', { signal: controller.signal, timeout: 5000 })
 } catch (error) {
     if (error instanceof HttpError) {
         // 伺服器回了非 2xx
+    } else if (error.name === 'TimeoutError') {
+        // 超過 5 秒
     } else if (error.name === 'AbortError') {
         // 被取消
     } else {

@@ -68,6 +68,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | --- | --- |
 | `query` | Query parameters object; see the rules below |
 | `body` | Only for `get` / `delete`; `post` / `put` / `patch` take the body as the second argument |
+| `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 
 ### Body rules
 
@@ -125,10 +126,12 @@ Network failures, aborts and timeouts are **not** wrapped in `HttpError`. They s
 const controller = new AbortController()
 
 try {
-    await http.get('/users', { signal: controller.signal })
+    await http.get('/users', { signal: controller.signal, timeout: 5000 })
 } catch (error) {
     if (error instanceof HttpError) {
         // the server responded with a non-2xx status
+    } else if (error.name === 'TimeoutError') {
+        // took longer than 5 seconds
     } else if (error.name === 'AbortError') {
         // the request was aborted
     } else {
