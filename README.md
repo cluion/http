@@ -10,7 +10,7 @@ A zero-dependency HTTP client built on the native Fetch API. It handles JSON, qu
 npm install @cluion/http
 ```
 
-Requires a global `fetch`: modern browsers, Node.js 18+, Bun or Deno.
+Requires a global `fetch`: modern browsers, Node.js 22+, Bun or Deno.
 
 ## Quick start
 
