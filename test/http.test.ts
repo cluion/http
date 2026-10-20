@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { HttpError, http } from '../src/index'
+import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
+import { HttpError, http } from '../src/index.js'
 
 // A real local server instead of a mocked fetch:
 // /echo responds with the received method, url, headers and body
@@ -152,6 +152,11 @@ describe('response parsing', () => {
     it('returns undefined for 204 and empty bodies', async () => {
         expect(await reply(204, 'application/json', '')).toBeUndefined()
         expect(await reply(200, 'application/json', '')).toBeUndefined()
+        expect(await reply(204, '', '')).toBeUndefined()
+    })
+
+    it('treats a whitespace-only JSON body as empty', async () => {
+        expect(await reply(200, 'application/json', ' \n')).toBeUndefined()
     })
 
     it('throws SyntaxError when a successful response has malformed JSON', async () => {
@@ -209,5 +214,73 @@ describe('timeout', () => {
     it('keeps a user abort as AbortError when a timeout is also set', async () => {
         const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort(), timeout: 1000 }).catch((e) => e)
         expect(error.name).toBe('AbortError')
+    })
+})
+
+describe('responseType', () => {
+    const replying = (type: string, body: string, status = 200) => ({ status, type, body })
+
+    it('text returns the raw string, even for JSON', async () => {
+        const text = await http.get(`${base}/reply`, {
+            query: replying('application/json', '{"a":1}'),
+            responseType: 'text',
+        })
+        expectTypeOf(text).toEqualTypeOf<string>()
+        expect(text).toBe('{"a":1}')
+    })
+
+    it('text returns an empty string for an empty body', async () => {
+        expect(await http.get(`${base}/reply`, { query: replying('text/plain', ''), responseType: 'text' })).toBe('')
+    })
+
+    it('json parses the body whatever the Content-Type', async () => {
+        const data = await http.get<{ a: number }>(`${base}/reply`, {
+            query: replying('text/plain', '{"a":1}'),
+            responseType: 'json',
+        })
+        expectTypeOf(data).toEqualTypeOf<{ a: number }>()
+        expect(data).toEqual({ a: 1 })
+    })
+
+    it('json returns undefined for an empty body', async () => {
+        expect(await http.get(`${base}/reply`, { query: replying('text/plain', ''), responseType: 'json' })).toBeUndefined()
+    })
+
+    it('blob returns a Blob with the response Content-Type', async () => {
+        const blob = await http.get(`${base}/reply`, {
+            query: replying('image/png', 'png-bytes'),
+            responseType: 'blob',
+        })
+        expectTypeOf(blob).toEqualTypeOf<Blob>()
+        expect(blob).toBeInstanceOf(Blob)
+        expect(blob.type).toBe('image/png')
+        expect(await blob.text()).toBe('png-bytes')
+    })
+
+    it('response returns the native Response with its body unread', async () => {
+        const response = await http.get(`${base}/reply`, {
+            query: replying('application/json', '{"a":1}'),
+            responseType: 'response',
+        })
+        expectTypeOf(response).toEqualTypeOf<Response>()
+        expect(response).toBeInstanceOf(Response)
+        expect(response.status).toBe(200)
+        expect(response.bodyUsed).toBe(false)
+        expect(await response.json()).toEqual({ a: 1 })
+    })
+
+    it('works on methods with a body', async () => {
+        const text = await http.post(`${base}/echo`, { a: 1 }, { responseType: 'text' })
+        expectTypeOf(text).toEqualTypeOf<string>()
+        expect(JSON.parse(text).body).toBe('{"a":1}')
+    })
+
+    it('still throws HttpError on non-2xx, with data parsed by Content-Type', async () => {
+        const error = await http.get(`${base}/reply`, {
+            query: replying('application/json', '{"message":"Not found"}', 404),
+            responseType: 'blob',
+        }).catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+        expect(error.data).toEqual({ message: 'Not found' })
     })
 })

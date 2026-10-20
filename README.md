@@ -69,6 +69,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `query` | Query parameters object; see the rules below |
 | `body` | Only for `get` / `delete`; `post` / `put` / `patch` take the body as the second argument |
 | `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
+| `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
 
 ### Body rules
 
@@ -98,15 +99,34 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 
 ### Return value
 
-The parsed body is returned directly:
+By default the parsed body is returned directly:
 
 | Response | Returns |
 | --- | --- |
 | JSON Content-Type (`application/json`, `*/*+json`) | The parsed value |
 | Any other Content-Type | A string |
-| 204 or an empty body | `undefined` |
+| 204, or an empty or whitespace-only body | `undefined` |
 
 If a successful response claims to be JSON but cannot be parsed, a native `SyntaxError` is thrown.
+
+Use `responseType` to choose how the body is read. TypeScript infers the return type from it:
+
+| `responseType` | Returns |
+| --- | --- |
+| `'json'` | The body parsed as JSON whatever the Content-Type; `undefined` when empty |
+| `'text'` | The body as a string; `''` when empty |
+| `'blob'` | A `Blob`, for files and images |
+| `'response'` | The native `Response` with its body unread, for status, headers or streaming |
+
+```js
+const avatar = await http.get('/avatar.png', { responseType: 'blob' })
+
+const response = await http.get('/users', { responseType: 'response' })
+response.headers.get('x-total-count')
+const users = await response.json()
+```
+
+Non-2xx responses still throw `HttpError` whatever the `responseType`. With `timeout`, reading the body of a `'response'` result counts towards the timeout as well.
 
 ### Errors
 
@@ -116,7 +136,7 @@ Only **non-2xx responses** throw `HttpError`:
 | --- | --- |
 | `status` | HTTP status code, e.g. `404` |
 | `statusText` | e.g. `Not Found` (may be empty over HTTP/2) |
-| `data` | The parsed error body; the raw text when it is malformed JSON |
+| `data` | The error body parsed by its Content-Type, whatever the `responseType`; the raw text when it is malformed JSON |
 | `response` | The native `Response` (its body has been read; use `data`) |
 | `message` | e.g. `HTTP 404 Not Found: GET /users` |
 

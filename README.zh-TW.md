@@ -69,6 +69,7 @@ const users = await http.get<User[]>('/users')
 | `query` | 查詢參數物件，見下方規則 |
 | `body` | 只在 `get` / `delete` 使用；`post` / `put` / `patch` 用第二個參數 |
 | `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
+| `responseType` | 成功回應的 body 讀取方式：`'json'`、`'text'`、`'blob'`、`'response'`，見「回傳值」 |
 
 ### body 規則
 
@@ -98,15 +99,34 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 
 ### 回傳值
 
-直接回傳解析後的 body：
+預設直接回傳解析後的 body：
 
 | 回應 | 回傳 |
 | --- | --- |
 | Content-Type 為 JSON（`application/json`、`*/*+json`） | 解析後的值 |
 | 其他 Content-Type | 字串 |
-| 204 或空內容 | `undefined` |
+| 204、空內容或只有空白 | `undefined` |
 
 成功回應宣稱是 JSON 卻無法解析時，會丟出原生 `SyntaxError`。
+
+可以用 `responseType` 指定讀取方式，TypeScript 會依此推論回傳型別：
+
+| `responseType` | 回傳 |
+| --- | --- |
+| `'json'` | 不管 Content-Type，一律當 JSON 解析；空內容為 `undefined` |
+| `'text'` | 字串；空內容為 `''` |
+| `'blob'` | `Blob`，適合檔案、圖片 |
+| `'response'` | 原生 `Response`，body 尚未讀取，可以讀 status、headers 或用串流處理 |
+
+```js
+const avatar = await http.get('/avatar.png', { responseType: 'blob' })
+
+const response = await http.get('/users', { responseType: 'response' })
+response.headers.get('x-total-count')
+const users = await response.json()
+```
+
+不管 `responseType` 是什麼，非 2xx 回應都會丟出 `HttpError`。有設定 `timeout` 時，讀取 `'response'` 的 body 也算在逾時時間內。
 
 ### 錯誤
 
@@ -116,7 +136,7 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 | --- | --- |
 | `status` | HTTP 狀態碼，例如 `404` |
 | `statusText` | 例如 `Not Found`（HTTP/2 可能為空字串） |
-| `data` | 已解析的錯誤內容；JSON 壞掉時為原始文字 |
+| `data` | 依 Content-Type 解析的錯誤內容（與 `responseType` 無關）；JSON 壞掉時為原始文字 |
 | `response` | 原生 `Response`（body 已讀取，請改用 `data`） |
 | `message` | 例如 `HTTP 404 Not Found: GET /users` |
 
