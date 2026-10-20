@@ -7,6 +7,11 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
     query?: Query
     /** Plain objects and arrays are sent as JSON; native bodies (FormData, Blob, string, ...) are sent as-is. */
     body?: unknown
+    /**
+     * Milliseconds before the request is aborted with a native `TimeoutError`.
+     * Covers the whole request, including reading the body. Omit it for no timeout.
+     */
+    timeout?: number
 }
 
 export type BodyRequestOptions = Omit<RequestOptions, 'body'>
@@ -70,8 +75,14 @@ function parseLoose(text: string, contentType: string | null): unknown {
     }
 }
 
+function withTimeout(signal: AbortSignal | null | undefined, timeout?: number) {
+    if (timeout === undefined) return signal
+    const timer = AbortSignal.timeout(timeout)
+    return signal ? AbortSignal.any([signal, timer]) : timer
+}
+
 async function request<T>(method: string, url: string, options: RequestOptions = {}): Promise<T> {
-    const { query, body, ...init } = options
+    const { query, body, timeout, ...init } = options
     const isJson = body != null && !isNativeBody(body)
 
     const headers = new Headers(init.headers)
@@ -84,6 +95,7 @@ async function request<T>(method: string, url: string, options: RequestOptions =
         method,
         headers,
         body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
+        signal: withTimeout(init.signal, timeout),
     })
     const text = await response.text()
     const contentType = response.headers.get('content-type')
