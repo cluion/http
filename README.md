@@ -168,7 +168,10 @@ pnpm test        # unit tests (against a real local server, fetch is not mocked)
 pnpm coverage    # coverage report
 pnpm typecheck
 pnpm build       # outputs dist/
+pnpm lint:package # checks the published package with publint and attw (run after build)
 ```
+
+For a change that should be released, run `pnpm changeset` and commit the generated file with your pull request.
 
 ## License
 
