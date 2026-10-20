@@ -168,7 +168,10 @@ pnpm test        # 單元測試（使用真實本機伺服器，不 mock fetch�
 pnpm coverage    # 覆蓋率
 pnpm typecheck
 pnpm build       # 輸出 dist/
+pnpm lint:package # 用 publint 和 attw 檢查要發佈的套件內容（需先 build）
 ```
+
+需要發佈的變更，請執行 `pnpm changeset`，並把產生的檔案跟 PR 一起 commit。
 
 ## 授權
 
