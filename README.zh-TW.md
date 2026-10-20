@@ -171,7 +171,7 @@ pnpm build       # 輸出 dist/
 pnpm lint:package # 用 publint 和 attw 檢查要發佈的套件內容（需先 build）
 ```
 
-需要發佈的變更，請執行 `pnpm changeset`，並把產生的檔案跟 PR 一起 commit。
+需要發佈的變更，請執行 `pnpm changeset`，並把產生的檔案跟 PR 一起 commit。合併後 release workflow 會開一個 `chore: version packages` PR，合併那個 PR 就會發佈到 npm，並附上 provenance。
 
 ## 授權
 
