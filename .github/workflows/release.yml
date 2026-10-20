@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The pnpm version comes from packageManager in package.json
+      - uses: pnpm/action-setup@v6
+      # Node 24 ships npm 11.5.1 or later, which npm trusted publishing requires
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # Opens or updates the version PR while changesets are pending; otherwise publishes
+      # any version not yet on npm, then tags it and creates a GitHub release
+      - id: changesets
+        uses: changesets/action@v2
+        with:
+          version-script: pnpm changeset version
+          publish-script: pnpm changeset publish
+          commit-message: 'chore: version packages'
+          pr-title: 'chore: version packages'
+
+      # A PR opened with GITHUB_TOKEN does not trigger workflows, but branch protection
+      # requires ci-gate, so run CI on the version PR's branch explicitly
+      - name: Run CI on the version PR
+        if: steps.changesets.outputs.pr-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "changeset-release/$GITHUB_REF_NAME"

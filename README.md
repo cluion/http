@@ -171,7 +171,7 @@ pnpm build       # outputs dist/
 pnpm lint:package # checks the published package with publint and attw (run after build)
 ```
 
-For a change that should be released, run `pnpm changeset` and commit the generated file with your pull request.
+For a change that should be released, run `pnpm changeset` and commit the generated file with your pull request. Once it is merged, the release workflow opens a `chore: version packages` pull request; merging that one publishes to npm with provenance.
 
 ## License
 
