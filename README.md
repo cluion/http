@@ -29,6 +29,10 @@ await http.get('/users', { query: { page: 1 } })
 // File upload: FormData is sent as-is
 await http.post('/upload', formData)
 
+// Shared defaults, such as a base URL and a token
+const api = http.create({ baseURL: 'https://api.example.com', headers: { Authorization: `Bearer ${token}` } })
+await api.get('/users')
+
 // Error handling
 try {
     await http.post('/users', { name: '' })
@@ -60,6 +64,8 @@ const users = await http.get<User[]>('/users')
 
 To send a body with `delete`, use `options.body`: `http.delete('/users', { body: { ids: [1, 2] } })`.
 
+`http` and every client made from it also have `create` and `extend`; see [Instances](#instances).
+
 ### Options
 
 Apart from the fields below, every native [`RequestInit`](https://developer.mozilla.org/docs/Web/API/RequestInit) option (`headers`, `signal`, `credentials`, `cache`, ...) is passed straight to `fetch`.
@@ -70,6 +76,8 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `body` | Only for `delete`; `post` / `put` / `patch` take the body as the second argument. `get` cannot send a body, since `fetch` does not allow one on GET |
 | `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`, as an integer from `0` to `2147483647` (about 24.8 days); other values throw a `RangeError` before the request is sent. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
+| `hooks` | Functions run before the request, on the response and on errors; see [Hooks](#hooks) |
+| `retry` | Retries network errors and statuses such as 503; off by default. See [Retry](#retry) |
 
 ### Body rules
 
@@ -95,7 +103,92 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 
 ### Headers
 
-`Accept: application/json, text/plain, */*` is sent by default (same as axios). Laravel uses this header to return JSON validation errors instead of redirecting. An `Accept` you set yourself replaces the default.
+`Accept: application/json, text/plain, */*` is sent by default (same as axios). Laravel uses this header to return JSON validation errors instead of redirecting. An `Accept` you set yourself replaces the default. A header set to `null` or `undefined` is not sent.
+
+### Instances
+
+`http.create(defaults)` returns a client with the same methods that applies `defaults` to every request. `defaults` takes every option except `body` and `responseType`, plus `baseURL`.
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com/v1',
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10000,
+})
+
+await api.get('/users')                           // GET https://api.example.com/v1/users
+await api.get('https://cdn.example.com/a.json')   // absolute URLs ignore baseURL
+await api.get('/status', { headers: { Authorization: null } })   // drop a default header
+
+const admin = api.extend({ baseURL: 'https://api.example.com/admin' })
+```
+
+- `baseURL` is joined to relative URLs with exactly one `/` between them. URLs with a scheme (`https://...`) or starting with `//` are used as-is (same as axios)
+- `headers` and `query` merge per key, and the request's values win. A value of `null` or `undefined` drops the default
+- `hooks` are appended: the client's run first, then the request's
+- Other options are replaced by the request's value, so `timeout: undefined` turns a default timeout off
+- `extend(defaults)` returns a new client with `defaults` merged into the current ones by the same rules. `create(defaults)` on any client starts over without them. Neither changes the client it is called on
+
+### Hooks
+
+Hooks run your own code at three points of every request. Each one is an array of functions, which may be async and run in order.
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    hooks: {
+        // Read the token on every request, so a new one is used as soon as it changes
+        onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${store.token}`)],
+        // Refresh an expired token and send the request again
+        onResponse: [async ({ response, retry }) => {
+            if (response.status === 401) {
+                await refreshToken()
+                return retry()
+            }
+        }],
+        onError: [(error) => report(error)],
+    },
+})
+```
+
+| Hook | Runs | Gets | Returning |
+| --- | --- | --- | --- |
+| `onRequest` | Before each send, including a retry | `{ method, url, headers, options }` | Nothing. Change `headers`, or assign `url` |
+| `onResponse` | For every status, before the body is read | The same, plus `response` and `retry` | A `Response` replaces the current one |
+| `onError` | Before an `HttpError` is thrown | The `HttpError` | An `Error` is thrown instead |
+
+- `retry()` sends the request again and resolves with the new `Response`; return it to use it. The `onRequest` hooks run again first, so they can add a refreshed token. The new response does not go through `onResponse` again, and `retry()` works once per request. A `ReadableStream` body can be read only once, so it cannot be retried
+- `url` already has `baseURL` and `query` applied, and `options` holds the request's options merged with the client's
+- Every `onError` hook gets the original `HttpError`. When several return an error, the last one is thrown. Network errors, aborts and timeouts do not reach `onError`
+- An error thrown by a hook rejects the request
+- `timeout` covers the hooks and the retry too
+- Hooks set on a request run after the client's, and `extend` appends its hooks after the parent's
+
+### Retry
+
+Retrying is off by default. Set `retry` to a number of retries, or to an object to change more:
+
+```js
+await http.get('/users', { retry: 2 })
+
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    retry: { limit: 3, statusCodes: [503], delay: (attempt) => 1000 * attempt },
+})
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `limit` | `2` | Retries after the first attempt |
+| `methods` | `['GET', 'PUT', 'DELETE']` | `POST` and `PATCH` are not idempotent and could create a record twice, so they are retried only when listed |
+| `statusCodes` | `[408, 429, 500, 502, 503, 504]` | Statuses that are retried. Network errors are retried too |
+| `delay` | `300`, `600`, `1200`, ... | `(attempt) => milliseconds` to wait before each retry, with `attempt` starting at 1 |
+| `maxRetryAfter` | `60000` | A longer `Retry-After` is not waited for |
+
+- A response with a `Retry-After` header, in seconds or as an HTTP date, is retried after that time instead of `delay`. When it is longer than `maxRetryAfter`, the response is used as is, so a 429 throws `HttpError` right away
+- Aborts and timeouts are not retried, and `timeout` covers every attempt and wait. A `ReadableStream` body can be read only once, so it is never retried
+- `onRequest` hooks run on every attempt, so each one reads the current token. `onResponse` sees only the final response, and a hook's `retry()` gets the same automatic retries
+- Like other options, a request's `retry` replaces the client's, so `retry: 0` turns it off for one request
 
 ### Return value
 
