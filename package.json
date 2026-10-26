@@ -1,6 +1,6 @@
 {
   "name": "@cluion/http",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A zero-dependency HTTP client built on the native Fetch API",
   "license": "MIT",
   "repository": {
