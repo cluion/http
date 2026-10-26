@@ -76,6 +76,7 @@ const users = await http.get<User[]>('/users')
 | `body` | 只在 `delete` 使用；`post` / `put` / `patch` 用第二個參數。`get` 不能帶 body，因為 `fetch` 不允許 GET 帶內容 |
 | `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。必須是 `0` 到 `2147483647`（約 24.8 天）的整數，其他值會在送出前丟出 `RangeError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
 | `responseType` | 成功回應的 body 讀取方式：`'json'`、`'text'`、`'blob'`、`'response'`，見「回傳值」 |
+| `hooks` | 在送出前、收到回應時、發生錯誤時執行的函式，見 [hooks](#hooks) |
 
 ### body 規則
 
@@ -123,8 +124,44 @@ const admin = api.extend({ baseURL: 'https://api.example.com/admin' })
 
 - `baseURL` 和相對路徑之間固定接一個 `/`。有協定（`https://...`）或以 `//` 開頭的網址會原樣使用（與 axios 相同）
 - `headers`、`query` 逐一 key 合併，以請求的值為準；值設成 `null` 或 `undefined` 就會拿掉預設值
+- `hooks` 會串接起來：實例的先執行，再執行請求的
 - 其他 options 由請求的值整個取代，所以 `timeout: undefined` 可以關掉預設的逾時
 - `extend(defaults)` 回傳新實例，依相同規則把 `defaults` 合併進目前的預設值；任何實例上的 `create(defaults)` 則不繼承，從頭開始。兩者都不會改變原本的實例
+
+### hooks
+
+hooks 讓你在每個請求的三個時間點執行自己的程式。每種 hook 都是函式陣列，依序執行，可以是 async。
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    hooks: {
+        // 每次請求都讀取當下的 token，token 一換新就會用新的
+        onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${store.token}`)],
+        // token 過期時刷新，再重送一次
+        onResponse: [async ({ response, retry }) => {
+            if (response.status === 401) {
+                await refreshToken()
+                return retry()
+            }
+        }],
+        onError: [(error) => report(error)],
+    },
+})
+```
+
+| hook | 執行時機 | 收到 | 回傳值的作用 |
+| --- | --- | --- | --- |
+| `onRequest` | 每次送出前，重送也會執行 | `{ method, url, headers, options }` | 不用回傳；直接修改 `headers`，或指定新的 `url` |
+| `onResponse` | 任何狀態碼，在讀取 body 之前 | 同上，再加上 `response`、`retry` | 回傳 `Response` 會取代目前的回應 |
+| `onError` | 丟出 `HttpError` 之前 | 該 `HttpError` | 回傳 `Error` 會改丟出它 |
+
+- `retry()` 會重送請求，並回傳新的 `Response`，要把它 return 才會採用。重送前會再跑一次 `onRequest`，所以可以帶上刷新後的 token。重送的回應不會再經過 `onResponse`，而且每個請求只能 `retry()` 一次。`ReadableStream` 只能讀一次，所以不能重送
+- `url` 已經套用 `baseURL` 和 `query`；`options` 是請求和實例合併後的 options
+- 每個 `onError` 收到的都是原本的 `HttpError`；有多個回傳錯誤時，丟出最後一個。網路錯誤、取消、逾時不會經過 `onError`
+- hook 丟出錯誤時，請求會以該錯誤失敗
+- `timeout` 也涵蓋 hooks 和重送的時間
+- 請求設定的 hooks 排在實例的之後執行；`extend` 的 hooks 排在父層之後
 
 ### 回傳值
 

@@ -7,6 +7,7 @@ import { HttpError, http } from '../src/index.js'
 // /echo, also under any prefix such as /api/echo, responds with the received method, url, headers and body
 // /reply?status=&type=&body= responds with the given status, Content-Type and body
 // /slow?ms=&stage= waits ms before sending the headers, or before finishing the body when stage=body
+// /auth responds 401 unless Authorization is "Bearer fresh", with the received body
 let server: Server
 let base: string
 
@@ -24,6 +25,13 @@ beforeAll(async () => {
                 headers: req.headers,
                 body: Buffer.concat(chunks).toString(),
             }))
+            return
+        }
+
+        if (url.pathname === '/auth') {
+            const ok = req.headers.authorization === 'Bearer fresh'
+            res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok, body: Buffer.concat(chunks).toString() }))
             return
         }
 
@@ -410,5 +418,165 @@ describe('create and extend', () => {
         http.create({ responseType: 'text' })
         // @ts-expect-error a body is given per request
         http.create({ body: 'x' })
+    })
+})
+
+describe('hooks', () => {
+    it('onRequest runs before every request, so headers can follow the current token', async () => {
+        let token = 'a'
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [async ({ headers }) => {
+                    await new Promise((resolve) => setTimeout(resolve, 5))
+                    headers.set('authorization', `Bearer ${token}`)
+                }],
+            },
+        })
+        expect((await api.get('/echo')).headers.authorization).toBe('Bearer a')
+        token = 'b'
+        expect((await api.get('/echo')).headers.authorization).toBe('Bearer b')
+    })
+
+    it('onRequest gets the method, the full URL and the options, and can replace the URL', async () => {
+        const api = http.create({
+            baseURL: 'http://127.0.0.1:1',
+            hooks: {
+                onRequest: [(context) => {
+                    expect(context.method).toBe('POST')
+                    expect(context.url).toBe('http://127.0.0.1:1/users?page=2')
+                    expect(context.options.body).toEqual({ a: 1 })
+                    context.url = `${base}/echo?via=hook`
+                }],
+            },
+        })
+        const echo = await api.post('/users', { a: 1 }, { query: { page: 2 } })
+        expect(echo.url).toBe('/echo?via=hook')
+        expect(echo.body).toBe('{"a":1}')
+    })
+
+    it('an error thrown by a hook rejects the request', async () => {
+        const api = http.create({ hooks: { onRequest: [() => { throw new Error('blocked') }] } })
+        await expect(api.get(`${base}/echo`)).rejects.toThrow('blocked')
+    })
+
+    it('runs the parent client hooks, then the child client, then the request', async () => {
+        const calls: string[] = []
+        const hook = (name: string) => () => { calls.push(name) }
+        const api = http.create({ baseURL: base, hooks: { onRequest: [hook('parent')] } })
+            .extend({ hooks: { onRequest: [hook('child')] } })
+        await api.get('/echo', { hooks: { onRequest: [hook('request')] } })
+        expect(calls).toEqual(['parent', 'child', 'request'])
+
+        calls.length = 0
+        await http.get(`${base}/echo`, { hooks: { onRequest: [hook('plain')] } })
+        expect(calls).toEqual(['plain'])
+    })
+
+    it('onResponse sees every status before the body is read, and can replace the response', async () => {
+        const seen: number[] = []
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onResponse: [({ response }) => {
+                    seen.push(response.status)
+                    expect(response.bodyUsed).toBe(false)
+                    if (response.status === 404) {
+                        return new Response('{"fallback":true}', { headers: { 'content-type': 'application/json' } })
+                    }
+                }],
+            },
+        })
+        expect(await api.get('/reply', { query: { status: 404 } })).toEqual({ fallback: true })
+        expect(await api.get('/reply', { query: { status: 200, type: 'text/plain', body: 'ok' } })).toBe('ok')
+        expect(seen).toEqual([404, 200])
+    })
+
+    it('retry() sends the request again, body included, after onResponse refreshes the token', async () => {
+        let token = 'stale'
+        let refreshes = 0
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [({ headers }) => headers.set('authorization', `Bearer ${token}`)],
+                onResponse: [async ({ response, retry }) => {
+                    if (response.status !== 401) return
+                    refreshes++
+                    token = 'fresh'
+                    return retry()
+                }],
+            },
+        })
+        expect(await api.post('/auth', { a: 1 })).toEqual({ ok: true, body: '{"a":1}' })
+        expect(refreshes).toBe(1)
+    })
+
+    it('does not run onResponse again on the retried response', async () => {
+        let calls = 0
+        const api = http.create({ baseURL: base, hooks: { onResponse: [({ retry }) => { calls++; return retry() }] } })
+        const error = await api.get('/auth').catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+        expect(error.status).toBe(401)
+        expect(calls).toBe(1)
+    })
+
+    it('retry() can only be called once per request', async () => {
+        const api = http.create({ baseURL: base, hooks: { onResponse: [async ({ retry }) => { await retry(); return retry() }] } })
+        await expect(api.get('/echo')).rejects.toThrow('retry() can only be called once per request')
+    })
+
+    it('retry() rejects for a ReadableStream body, which cannot be sent again', async () => {
+        const api = http.create({ baseURL: base, hooks: { onResponse: [({ retry }) => retry()] } })
+        await expect(api.post('/echo', new Blob(['x']).stream())).rejects.toThrow('A ReadableStream body cannot be sent again')
+    })
+
+    it('the timeout also covers the hooks', async () => {
+        const api = http.create({
+            baseURL: base,
+            timeout: 50,
+            hooks: { onRequest: [() => new Promise((resolve) => setTimeout(resolve, 100))] },
+        })
+        expect((await api.get('/echo').catch((e) => e)).name).toBe('TimeoutError')
+    })
+
+    it('onError gets each HttpError, and the last error returned is thrown instead', async () => {
+        class AppError extends Error {}
+        const seen: unknown[] = []
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onError: [
+                    (error) => { seen.push(error) },
+                    (error) => new AppError(`app: ${error.status}`),
+                    (error) => { seen.push(error) },
+                ],
+            },
+        })
+        const error = await api.get('/reply', { query: { status: 500 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(AppError)
+        expect(error.message).toBe('app: 500')
+        expect(seen).toHaveLength(2)
+        for (const each of seen) expect(each).toBeInstanceOf(HttpError)
+    })
+
+    it('ignores hook return values that are not a Response or an Error, such as false from `ok && retry()`', async () => {
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onResponse: [() => false as unknown as void],
+                onError: [() => 'not an error' as unknown as void],
+            },
+        })
+        expect((await api.get('/echo')).method).toBe('GET')
+        const error = await api.get('/reply', { query: { status: 500 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+    })
+
+    it('onError is not called for successful responses or network errors', async () => {
+        let calls = 0
+        const api = http.create({ hooks: { onError: [() => { calls++ }] } })
+        await api.get(`${base}/echo`)
+        await api.get('http://127.0.0.1:1/').catch(() => {})
+        expect(calls).toBe(0)
     })
 })

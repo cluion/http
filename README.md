@@ -76,6 +76,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `body` | Only for `delete`; `post` / `put` / `patch` take the body as the second argument. `get` cannot send a body, since `fetch` does not allow one on GET |
 | `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`, as an integer from `0` to `2147483647` (about 24.8 days); other values throw a `RangeError` before the request is sent. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
+| `hooks` | Functions run before the request, on the response and on errors; see [Hooks](#hooks) |
 
 ### Body rules
 
@@ -123,8 +124,44 @@ const admin = api.extend({ baseURL: 'https://api.example.com/admin' })
 
 - `baseURL` is joined to relative URLs with exactly one `/` between them. URLs with a scheme (`https://...`) or starting with `//` are used as-is (same as axios)
 - `headers` and `query` merge per key, and the request's values win. A value of `null` or `undefined` drops the default
+- `hooks` are appended: the client's run first, then the request's
 - Other options are replaced by the request's value, so `timeout: undefined` turns a default timeout off
 - `extend(defaults)` returns a new client with `defaults` merged into the current ones by the same rules. `create(defaults)` on any client starts over without them. Neither changes the client it is called on
+
+### Hooks
+
+Hooks run your own code at three points of every request. Each one is an array of functions, which may be async and run in order.
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    hooks: {
+        // Read the token on every request, so a new one is used as soon as it changes
+        onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${store.token}`)],
+        // Refresh an expired token and send the request again
+        onResponse: [async ({ response, retry }) => {
+            if (response.status === 401) {
+                await refreshToken()
+                return retry()
+            }
+        }],
+        onError: [(error) => report(error)],
+    },
+})
+```
+
+| Hook | Runs | Gets | Returning |
+| --- | --- | --- | --- |
+| `onRequest` | Before each send, including a retry | `{ method, url, headers, options }` | Nothing. Change `headers`, or assign `url` |
+| `onResponse` | For every status, before the body is read | The same, plus `response` and `retry` | A `Response` replaces the current one |
+| `onError` | Before an `HttpError` is thrown | The `HttpError` | An `Error` is thrown instead |
+
+- `retry()` sends the request again and resolves with the new `Response`; return it to use it. The `onRequest` hooks run again first, so they can add a refreshed token. The new response does not go through `onResponse` again, and `retry()` works once per request. A `ReadableStream` body can be read only once, so it cannot be retried
+- `url` already has `baseURL` and `query` applied, and `options` holds the request's options merged with the client's
+- Every `onError` hook gets the original `HttpError`. When several return an error, the last one is thrown. Network errors, aborts and timeouts do not reach `onError`
+- An error thrown by a hook rejects the request
+- `timeout` covers the hooks and the retry too
+- Hooks set on a request run after the client's, and `extend` appends its hooks after the parent's
 
 ### Return value
 

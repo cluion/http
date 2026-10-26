@@ -23,6 +23,8 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'h
      */
     timeout?: number
     responseType?: ResponseType
+    /** Appended to the hooks of the client, which run first. */
+    hooks?: Hooks
 }
 
 /** Options without `body`: for `get`, which cannot send one, and for methods taking the body as an argument. */
@@ -44,10 +46,38 @@ interface MethodWithBody {
     <T = any>(url: string, body?: unknown, options?: BodyRequestOptions & { responseType?: 'json' }): Promise<T>
 }
 
-/** Defaults for every request of a client. `headers` and `query` merge per key; other options are replaced. */
+/** Defaults for every request of a client. `headers` and `query` merge per key, `hooks` are appended, other options are replaced. */
 export interface ClientOptions extends Omit<RequestOptions, 'body' | 'responseType'> {
     /** Joined to relative URLs; absolute (`https://...`) and protocol-relative (`//host`) URLs are used as-is. */
     baseURL?: string
+}
+
+export interface RequestContext {
+    readonly method: string
+    /** The URL to request, with `baseURL` and `query` applied. `onRequest` hooks may replace it. */
+    url: string
+    /** The headers to send. `onRequest` hooks may change them. */
+    readonly headers: Headers
+    /** The options of the request, merged with the client's. */
+    readonly options: Readonly<RequestOptions & ClientOptions>
+}
+
+export interface ResponseContext extends RequestContext {
+    /** The native `Response`, with its body unread. */
+    readonly response: Response
+    /** Sends the request again, running the `onRequest` hooks first, and resolves with the new response. Once per request. */
+    retry(): Promise<Response>
+}
+
+type Awaitable<T> = T | Promise<T>
+
+export interface Hooks {
+    /** Run before each send, including a retry. */
+    onRequest?: ((context: RequestContext) => Awaitable<void>)[]
+    /** Run for every status before the body is read. A returned `Response` replaces the current one. */
+    onResponse?: ((context: ResponseContext) => Awaitable<Response | void>)[]
+    /** Run before an `HttpError` is thrown, each with that error. The last `Error` returned is thrown instead. */
+    onError?: ((error: HttpError) => Awaitable<Error | void>)[]
 }
 
 export interface HttpClient {
@@ -131,12 +161,20 @@ function mergeHeaders(...sources: (HeadersOption | undefined)[]): Headers {
 }
 
 type Options = RequestOptions & ClientOptions
+type Merged = Options & { headers: Headers, hooks: Required<Hooks> }
 
-const merge = (defaults: ClientOptions, options: Options): Options => ({
+const mergeHooks = (a: Hooks = {}, b: Hooks = {}): Required<Hooks> => ({
+    onRequest: [...(a.onRequest ?? []), ...(b.onRequest ?? [])],
+    onResponse: [...(a.onResponse ?? []), ...(b.onResponse ?? [])],
+    onError: [...(a.onError ?? []), ...(b.onError ?? [])],
+})
+
+const merge = (defaults: ClientOptions, options: Options): Merged => ({
     ...defaults,
     ...options,
     headers: mergeHeaders(defaults.headers, options.headers),
     query: { ...defaults.query, ...options.query },
+    hooks: mergeHooks(defaults.hooks, options.hooks),
 })
 
 // Longer delays overflow the timer, and the request aborts almost immediately
@@ -176,28 +214,58 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
     }
 }
 
-async function request(method: string, url: string, options: Options): Promise<any> {
-    const { baseURL, query, body, timeout, responseType, headers: headersOption, ...init } = options
+async function request(method: string, url: string, options: Merged): Promise<any> {
+    const { baseURL, query, body, timeout, responseType, headers: headersOption, hooks, ...init } = options
     const isJson = body != null && !isNativeBody(body)
-
-    const headers = mergeHeaders(headersOption)
-    if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
-    if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
-
     const fullUrl = withQuery(withBase(url, baseURL), query)
-    const response = await fetch(fullUrl, {
-        // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
-        ...(body instanceof ReadableStream && { duplex: 'half' }),
-        ...init,
-        method,
-        headers,
-        body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
-        signal: withTimeout(init.signal, timeout),
-    })
+    // Created once, so the timeout also covers the hooks and a retry
+    const signal = withTimeout(init.signal, timeout)
+    const context = { method, url: fullUrl, headers: new Headers(), options }
+
+    // Each send, a retry included, starts again from the merged URL and headers
+    const send = async () => {
+        const headers = new Headers(headersOption)
+        if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
+        if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
+        context.url = fullUrl
+        context.headers = headers
+        for (const hook of hooks.onRequest) await hook(context)
+
+        return fetch(context.url, {
+            // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
+            ...(body instanceof ReadableStream && { duplex: 'half' }),
+            ...init,
+            method,
+            headers: context.headers,
+            body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
+            signal,
+        })
+    }
+
+    let retried = false
+    const retry = () => {
+        if (retried) return Promise.reject(new Error('retry() can only be called once per request'))
+        if (body instanceof ReadableStream) return Promise.reject(new TypeError('A ReadableStream body cannot be sent again'))
+        retried = true
+        return send()
+    }
+
+    // Other return values are ignored, so a JavaScript hook like `ok && retry()` returning false keeps the response
+    let response = await send()
+    for (const hook of hooks.onResponse) {
+        const next = await hook({ ...context, response, retry })
+        if (next instanceof Response) response = next
+    }
 
     if (!response.ok) {
         const data = parseLoose(await response.text(), response.headers.get('content-type'))
-        throw new HttpError(method, fullUrl, response, data)
+        const error = new HttpError(method, context.url, response, data)
+        let thrown: Error = error
+        for (const hook of hooks.onError) {
+            const next = await hook(error)
+            if (next instanceof Error) thrown = next
+        }
+        throw thrown
     }
     return readBody(response, responseType)
 }
