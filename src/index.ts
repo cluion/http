@@ -14,22 +14,23 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
     /** Plain objects and arrays are sent as JSON; native bodies (FormData, Blob, string, ...) are sent as-is. */
     body?: unknown
     /**
-     * Milliseconds before the request is aborted with a native `TimeoutError`.
-     * Covers the whole request, including reading the body. Omit it for no timeout.
+     * Milliseconds before the request is aborted with a native `TimeoutError`, as an integer
+     * from 0 to 2147483647. Covers the whole request, including reading the body. Omit it for no timeout.
      */
     timeout?: number
     responseType?: ResponseType
 }
 
+/** Options without `body`: for `get`, which cannot send one, and for methods taking the body as an argument. */
 export type BodyRequestOptions = Omit<RequestOptions, 'body'>
 
 type Typed<O, R extends ResponseType> = O & { responseType: R }
 
-interface MethodWithoutBody {
-    (url: string, options: Typed<RequestOptions, 'text'>): Promise<string>
-    (url: string, options: Typed<RequestOptions, 'blob'>): Promise<Blob>
-    (url: string, options: Typed<RequestOptions, 'response'>): Promise<Response>
-    <T = any>(url: string, options?: RequestOptions & { responseType?: 'json' }): Promise<T>
+interface MethodWithoutBody<O> {
+    (url: string, options: Typed<O, 'text'>): Promise<string>
+    (url: string, options: Typed<O, 'blob'>): Promise<Blob>
+    (url: string, options: Typed<O, 'response'>): Promise<Response>
+    <T = any>(url: string, options?: O & { responseType?: 'json' }): Promise<T>
 }
 
 interface MethodWithBody {
@@ -85,8 +86,14 @@ function withQuery(url: string, query: Query = {}): string {
     return `${path}${path.includes('?') ? '&' : '?'}${search}`
 }
 
+// Longer delays overflow the timer, and the request aborts almost immediately
+const MAX_TIMEOUT = 2 ** 31 - 1
+
 function withTimeout(signal: AbortSignal | null | undefined, timeout?: number) {
     if (timeout === undefined) return signal
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > MAX_TIMEOUT) {
+        throw new RangeError(`timeout must be an integer from 0 to ${MAX_TIMEOUT} milliseconds, got ${String(timeout)}`)
+    }
     const timer = AbortSignal.timeout(timeout)
     return signal ? AbortSignal.any([signal, timer]) : timer
 }
@@ -126,6 +133,8 @@ async function request(method: string, url: string, options: RequestOptions = {}
 
     const fullUrl = withQuery(url, query)
     const response = await fetch(fullUrl, {
+        // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
+        ...(body instanceof ReadableStream && { duplex: 'half' }),
         ...init,
         method,
         headers,
@@ -140,15 +149,15 @@ async function request(method: string, url: string, options: RequestOptions = {}
     return readBody(response, responseType)
 }
 
-const withoutBody = (method: string): MethodWithoutBody =>
-    (url: string, options?: RequestOptions) => request(method, url, options)
+const withoutBody = <O extends BodyRequestOptions>(method: string): MethodWithoutBody<O> =>
+    (url: string, options?: O) => request(method, url, options)
 
 const withBody = (method: string): MethodWithBody =>
     (url: string, body?: unknown, options?: BodyRequestOptions) => request(method, url, { ...options, body })
 
 export const http = {
-    get: withoutBody('GET'),
-    delete: withoutBody('DELETE'),
+    get: withoutBody<BodyRequestOptions>('GET'),
+    delete: withoutBody<RequestOptions>('DELETE'),
     post: withBody('POST'),
     put: withBody('PUT'),
     patch: withBody('PATCH'),
