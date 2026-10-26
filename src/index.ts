@@ -9,7 +9,11 @@ export type Query = Record<string, QueryValue | readonly QueryValue[]>
  */
 export type ResponseType = 'json' | 'text' | 'blob' | 'response'
 
-export interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
+/** Like `HeadersInit`, but a null or undefined value is not sent and drops a client default. */
+export type HeadersOption = HeadersInit | Record<string, string | null | undefined>
+
+export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'headers'> {
+    headers?: HeadersOption
     query?: Query
     /** Plain objects and arrays are sent as JSON; native bodies (FormData, Blob, string, ...) are sent as-is. */
     body?: unknown
@@ -38,6 +42,24 @@ interface MethodWithBody {
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'blob'>): Promise<Blob>
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'response'>): Promise<Response>
     <T = any>(url: string, body?: unknown, options?: BodyRequestOptions & { responseType?: 'json' }): Promise<T>
+}
+
+/** Defaults for every request of a client. `headers` and `query` merge per key; other options are replaced. */
+export interface ClientOptions extends Omit<RequestOptions, 'body' | 'responseType'> {
+    /** Joined to relative URLs; absolute (`https://...`) and protocol-relative (`//host`) URLs are used as-is. */
+    baseURL?: string
+}
+
+export interface HttpClient {
+    get: MethodWithoutBody<BodyRequestOptions>
+    delete: MethodWithoutBody<RequestOptions>
+    post: MethodWithBody
+    put: MethodWithBody
+    patch: MethodWithBody
+    /** A new client with these defaults only, without inheriting this client's. */
+    create(defaults?: ClientOptions): HttpClient
+    /** A new client with these defaults merged into this client's, which stay unchanged. */
+    extend(defaults: ClientOptions): HttpClient
 }
 
 /** A non-2xx response. Network errors, aborts and timeouts stay native (TypeError / AbortError / TimeoutError). */
@@ -86,6 +108,37 @@ function withQuery(url: string, query: Query = {}): string {
     return `${path}${path.includes('?') ? '&' : '?'}${search}`
 }
 
+// URLs with a scheme or starting with // ignore baseURL, as in axios
+const ABSOLUTE_URL = /^([a-z][a-z\d+\-.]*:)?\/\//i
+
+function withBase(url: string, baseURL?: string): string {
+    if (!baseURL || ABSOLUTE_URL.test(url)) return url
+    return url ? `${baseURL.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}` : baseURL
+}
+
+/** Later sources win per header name; a null or undefined value drops the header. */
+function mergeHeaders(...sources: (HeadersOption | undefined)[]): Headers {
+    const headers = new Headers()
+    const apply = (value: string | null | undefined, name: string) => {
+        if (value == null) headers.delete(name)
+        else headers.set(name, value)
+    }
+    for (const source of sources) {
+        if (source instanceof Headers || Array.isArray(source)) new Headers(source).forEach(apply)
+        else for (const [name, value] of Object.entries(source ?? {})) apply(value, name)
+    }
+    return headers
+}
+
+type Options = RequestOptions & ClientOptions
+
+const merge = (defaults: ClientOptions, options: Options): Options => ({
+    ...defaults,
+    ...options,
+    headers: mergeHeaders(defaults.headers, options.headers),
+    query: { ...defaults.query, ...options.query },
+})
+
 // Longer delays overflow the timer, and the request aborts almost immediately
 const MAX_TIMEOUT = 2 ** 31 - 1
 
@@ -123,15 +176,15 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
     }
 }
 
-async function request(method: string, url: string, options: RequestOptions = {}): Promise<any> {
-    const { query, body, timeout, responseType, ...init } = options
+async function request(method: string, url: string, options: Options): Promise<any> {
+    const { baseURL, query, body, timeout, responseType, headers: headersOption, ...init } = options
     const isJson = body != null && !isNativeBody(body)
 
-    const headers = new Headers(init.headers)
+    const headers = mergeHeaders(headersOption)
     if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
     if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
 
-    const fullUrl = withQuery(url, query)
+    const fullUrl = withQuery(withBase(url, baseURL), query)
     const response = await fetch(fullUrl, {
         // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
         ...(body instanceof ReadableStream && { duplex: 'half' }),
@@ -149,16 +202,24 @@ async function request(method: string, url: string, options: RequestOptions = {}
     return readBody(response, responseType)
 }
 
-const withoutBody = <O extends BodyRequestOptions>(method: string): MethodWithoutBody<O> =>
-    (url: string, options?: O) => request(method, url, options)
+function client(defaults: ClientOptions): HttpClient {
+    const send = (method: string, url: string, options: Options = {}) => request(method, url, merge(defaults, options))
 
-const withBody = (method: string): MethodWithBody =>
-    (url: string, body?: unknown, options?: BodyRequestOptions) => request(method, url, { ...options, body })
+    const withoutBody = (method: string) =>
+        (url: string, options?: RequestOptions) => send(method, url, options)
 
-export const http = {
-    get: withoutBody<BodyRequestOptions>('GET'),
-    delete: withoutBody<RequestOptions>('DELETE'),
-    post: withBody('POST'),
-    put: withBody('PUT'),
-    patch: withBody('PATCH'),
+    const withBody = (method: string) =>
+        (url: string, body?: unknown, options?: BodyRequestOptions) => send(method, url, { ...options, body })
+
+    return {
+        get: withoutBody('GET'),
+        delete: withoutBody('DELETE'),
+        post: withBody('POST'),
+        put: withBody('PUT'),
+        patch: withBody('PATCH'),
+        create: (options = {}) => client(merge({}, options)),
+        extend: (options) => client(merge(defaults, options)),
+    }
 }
+
+export const http = client({})

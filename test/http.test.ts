@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
 import { HttpError, http } from '../src/index.js'
 
 // A real local server instead of a mocked fetch:
-// /echo responds with the received method, url, headers and body
+// /echo, also under any prefix such as /api/echo, responds with the received method, url, headers and body
 // /reply?status=&type=&body= responds with the given status, Content-Type and body
 // /slow?ms=&stage= waits ms before sending the headers, or before finishing the body when stage=body
 let server: Server
@@ -16,7 +16,7 @@ beforeAll(async () => {
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
 
-        if (url.pathname === '/echo') {
+        if (url.pathname.endsWith('/echo')) {
             res.setHeader('content-type', 'application/json; charset=utf-8')
             res.end(JSON.stringify({
                 method: req.method,
@@ -131,6 +131,12 @@ describe('headers', () => {
         expect(echo.headers.accept).toBe('text/html')
         expect(echo.headers['x-token']).toBe('abc')
         expect(headers).toEqual({ 'Content-Type': 'application/vnd.api+json', Accept: 'text/html', 'X-Token': 'abc' })
+    })
+
+    it('does not send headers set to null or undefined', async () => {
+        const echo = await http.get(`${base}/echo`, { headers: { 'X-A': null, 'X-B': undefined } })
+        expect(echo.headers['x-a']).toBeUndefined()
+        expect(echo.headers['x-b']).toBeUndefined()
     })
 })
 
@@ -306,5 +312,103 @@ describe('responseType', () => {
         }).catch((e) => e)
         expect(error).toBeInstanceOf(HttpError)
         expect(error.data).toEqual({ message: 'Not found' })
+    })
+})
+
+describe('create and extend', () => {
+    it.each([['/api', '/echo'], ['/api/', '/echo'], ['/api', 'echo'], ['/api//', 'echo']])(
+        'joins baseURL %s and %s with one slash',
+        async (prefix, path) => {
+            const api = http.create({ baseURL: `${base}${prefix}` })
+            expect((await api.get(path)).url).toBe('/api/echo')
+        },
+    )
+
+    it('uses baseURL alone for an empty path', async () => {
+        expect((await http.create({ baseURL: `${base}/api/echo` }).get('')).url).toBe('/api/echo')
+    })
+
+    it('uses absolute and protocol-relative URLs as-is', async () => {
+        const api = http.create({ baseURL: 'http://127.0.0.1:1/unused' })
+        expect((await api.get(`${base}/echo`)).url).toBe('/echo')
+        // Node.js has no page to resolve //host against, so fetch gets the URL unchanged and cannot parse it
+        const host = base.slice('http://'.length)
+        await expect(api.get(`//${host}/echo`)).rejects.toThrow(`Failed to parse URL from //${host}/echo`)
+    })
+
+    it('includes baseURL in the HttpError message', async () => {
+        const error = await http.create({ baseURL: base }).get('/reply', { query: { status: 404 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+        expect(error.message).toBe(`HTTP 404 Not Found: GET ${base}/reply?status=404`)
+    })
+
+    it('merges headers per name, and null or undefined drops a default', async () => {
+        const api = http.create({ headers: { Authorization: 'Bearer a', 'X-App': 'web', 'X-Env': 'prod' } })
+        const echo = await api.get(`${base}/echo`, {
+            headers: { authorization: 'Bearer b', 'X-App': null, 'X-Env': undefined, 'X-Call': '1' },
+        })
+        expect(echo.headers.authorization).toBe('Bearer b')
+        expect(echo.headers['x-app']).toBeUndefined()
+        expect(echo.headers['x-env']).toBeUndefined()
+        expect(echo.headers['x-call']).toBe('1')
+        expect(echo.headers.accept).toBe('application/json, text/plain, */*')
+    })
+
+    it('accepts Headers and arrays as default headers', async () => {
+        const api = http.create({ headers: new Headers({ 'X-A': '1', 'X-B': '2' }) }).extend({ headers: [['X-C', '3']] })
+        const echo = await api.get(`${base}/echo`, { headers: { 'X-A': null } })
+        expect(echo.headers['x-a']).toBeUndefined()
+        expect(echo.headers['x-b']).toBe('2')
+        expect(echo.headers['x-c']).toBe('3')
+    })
+
+    it('merges query per key, and null drops a default', async () => {
+        const api = http.create({ baseURL: base, query: { lang: 'zh', page: 1 } })
+        expect((await api.get('/echo')).url).toBe('/echo?lang=zh&page=1')
+        expect((await api.get('/echo', { query: { page: 2, lang: null, q: 'x' } })).url).toBe('/echo?page=2&q=x')
+    })
+
+    it('applies a default timeout, which a request can turn off', async () => {
+        const api = http.create({ baseURL: base, timeout: 50 })
+        expect((await api.get('/slow', { query: { ms: 500 } }).catch((e) => e)).name).toBe('TimeoutError')
+        expect(await api.get('/slow', { query: { ms: 100 }, timeout: undefined })).toBe('done')
+    })
+
+    it('extend inherits the defaults, create starts over, and neither changes the original', async () => {
+        const api = http.create({ baseURL: base, headers: { 'X-App': 'web' } })
+        const admin = api.extend({ baseURL: `${base}/admin`, headers: { 'X-Role': 'admin' } })
+
+        const echo = await admin.get('/echo')
+        expect(echo.url).toBe('/admin/echo')
+        expect(echo.headers['x-app']).toBe('web')
+        expect(echo.headers['x-role']).toBe('admin')
+
+        expect((await api.create({ baseURL: base }).get('/echo')).headers['x-app']).toBeUndefined()
+        expect((await api.get('/echo')).headers['x-role']).toBeUndefined()
+    })
+
+    it.each(['create', 'extend'] as const)('%s copies the defaults, so changing them later has no effect', async (method) => {
+        const defaults = { baseURL: base, headers: { 'X-A': '1' } as Record<string, string>, query: { a: 1 } }
+        const api = http[method](defaults)
+        defaults.baseURL = 'http://127.0.0.1:1'
+        defaults.headers['X-A'] = '2'
+        defaults.query.a = 2
+        const echo = await api.get('/echo')
+        expect(echo.headers['x-a']).toBe('1')
+        expect(echo.url).toBe('/echo?a=1')
+    })
+
+    it('keeps body handling and responseType inference', async () => {
+        const api = http.create({ baseURL: base })
+        const text = await api.post('/echo', { a: 1 }, { responseType: 'text' })
+        expectTypeOf(text).toEqualTypeOf<string>()
+        expect(JSON.parse(text).body).toBe('{"a":1}')
+    })
+
+    it('does not take body or responseType as defaults', () => {
+        // @ts-expect-error a default responseType would break the inferred return types
+        http.create({ responseType: 'text' })
+        // @ts-expect-error a body is given per request
+        http.create({ body: 'x' })
     })
 })
