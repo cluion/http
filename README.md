@@ -29,6 +29,10 @@ await http.get('/users', { query: { page: 1 } })
 // File upload: FormData is sent as-is
 await http.post('/upload', formData)
 
+// Shared defaults, such as a base URL and a token
+const api = http.create({ baseURL: 'https://api.example.com', headers: { Authorization: `Bearer ${token}` } })
+await api.get('/users')
+
 // Error handling
 try {
     await http.post('/users', { name: '' })
@@ -59,6 +63,8 @@ const users = await http.get<User[]>('/users')
 | `http.patch` | `(url, body?, options?)` |
 
 To send a body with `delete`, use `options.body`: `http.delete('/users', { body: { ids: [1, 2] } })`.
+
+`http` and every client made from it also have `create` and `extend`; see [Instances](#instances).
 
 ### Options
 
@@ -95,7 +101,30 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 
 ### Headers
 
-`Accept: application/json, text/plain, */*` is sent by default (same as axios). Laravel uses this header to return JSON validation errors instead of redirecting. An `Accept` you set yourself replaces the default.
+`Accept: application/json, text/plain, */*` is sent by default (same as axios). Laravel uses this header to return JSON validation errors instead of redirecting. An `Accept` you set yourself replaces the default. A header set to `null` or `undefined` is not sent.
+
+### Instances
+
+`http.create(defaults)` returns a client with the same methods that applies `defaults` to every request. `defaults` takes every option except `body` and `responseType`, plus `baseURL`.
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com/v1',
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10000,
+})
+
+await api.get('/users')                           // GET https://api.example.com/v1/users
+await api.get('https://cdn.example.com/a.json')   // absolute URLs ignore baseURL
+await api.get('/status', { headers: { Authorization: null } })   // drop a default header
+
+const admin = api.extend({ baseURL: 'https://api.example.com/admin' })
+```
+
+- `baseURL` is joined to relative URLs with exactly one `/` between them. URLs with a scheme (`https://...`) or starting with `//` are used as-is (same as axios)
+- `headers` and `query` merge per key, and the request's values win. A value of `null` or `undefined` drops the default
+- Other options are replaced by the request's value, so `timeout: undefined` turns a default timeout off
+- `extend(defaults)` returns a new client with `defaults` merged into the current ones by the same rules. `create(defaults)` on any client starts over without them. Neither changes the client it is called on
 
 ### Return value
 

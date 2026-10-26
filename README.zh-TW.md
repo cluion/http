@@ -29,6 +29,10 @@ await http.get('/users', { query: { page: 1 } })
 // 上傳檔案：FormData 原樣送出
 await http.post('/upload', formData)
 
+// 共用預設值，例如 base URL 和 token
+const api = http.create({ baseURL: 'https://api.example.com', headers: { Authorization: `Bearer ${token}` } })
+await api.get('/users')
+
 // 錯誤處理
 try {
     await http.post('/users', { name: '' })
@@ -59,6 +63,8 @@ const users = await http.get<User[]>('/users')
 | `http.patch` | `(url, body?, options?)` |
 
 `delete` 需要帶內容時用 `options.body`：`http.delete('/users', { body: { ids: [1, 2] } })`。
+
+`http` 和由它建立的每個實例也都有 `create`、`extend`，見[實例](#實例)。
 
 ### options
 
@@ -95,7 +101,30 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 
 ### headers
 
-預設帶 `Accept: application/json, text/plain, */*`（與 axios 相同）。Laravel 依這個 header 判斷要回傳 JSON 驗證錯誤，而不是重新導向。自己設定的 `Accept` 會覆蓋預設值。
+預設帶 `Accept: application/json, text/plain, */*`（與 axios 相同）。Laravel 依這個 header 判斷要回傳 JSON 驗證錯誤，而不是重新導向。自己設定的 `Accept` 會覆蓋預設值。值為 `null` 或 `undefined` 的 header 不會送出。
+
+### 實例
+
+`http.create(defaults)` 會回傳一個方法相同的實例，每個請求都會套用 `defaults`。`defaults` 可以設定 `body`、`responseType` 以外的所有 options，另外多了 `baseURL`。
+
+```js
+const api = http.create({
+    baseURL: 'https://api.example.com/v1',
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10000,
+})
+
+await api.get('/users')                           // GET https://api.example.com/v1/users
+await api.get('https://cdn.example.com/a.json')   // 完整網址會忽略 baseURL
+await api.get('/status', { headers: { Authorization: null } })   // 拿掉預設的 header
+
+const admin = api.extend({ baseURL: 'https://api.example.com/admin' })
+```
+
+- `baseURL` 和相對路徑之間固定接一個 `/`。有協定（`https://...`）或以 `//` 開頭的網址會原樣使用（與 axios 相同）
+- `headers`、`query` 逐一 key 合併，以請求的值為準；值設成 `null` 或 `undefined` 就會拿掉預設值
+- 其他 options 由請求的值整個取代，所以 `timeout: undefined` 可以關掉預設的逾時
+- `extend(defaults)` 回傳新實例，依相同規則把 `defaults` 合併進目前的預設值；任何實例上的 `create(defaults)` 則不繼承，從頭開始。兩者都不會改變原本的實例
 
 ### 回傳值
 
