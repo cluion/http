@@ -55,7 +55,9 @@ const reply = (status: number, type: string, body: string) =>
 
 describe('HTTP methods', () => {
     it.each(['get', 'delete'] as const)('%s sends the matching method', async (method) => {
-        const echo = await http[method](`${base}/echo`)
+        // get and delete only differ in whether options.body is allowed
+        const send: typeof http.delete = http[method]
+        const echo = await send(`${base}/echo`)
         expect(echo.method).toBe(method.toUpperCase())
         expect(echo.body).toBe('')
     })
@@ -82,6 +84,12 @@ describe('HTTP methods', () => {
         const echo = await http.delete(`${base}/echo`, { body: { ids: [1, 2] } })
         expect(JSON.parse(echo.body)).toEqual({ ids: [1, 2] })
     })
+
+    it('get takes no body, and fetch rejects one passed anyway', async () => {
+        // @ts-expect-error fetch does not allow a body on GET
+        const error = await http.get(`${base}/echo`, { body: { a: 1 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(TypeError)
+    })
 })
 
 describe('native bodies are sent as-is', () => {
@@ -102,6 +110,11 @@ describe('native bodies are sent as-is', () => {
     it('a string is not JSON-stringified', async () => {
         const echo = await http.post(`${base}/echo`, 'hello')
         expect(echo.body).toBe('hello')
+    })
+
+    it('a ReadableStream is streamed without having to set duplex', async () => {
+        const echo = await http.post(`${base}/echo`, new Blob(['streamed']).stream())
+        expect(echo.body).toBe('streamed')
     })
 })
 
@@ -214,6 +227,17 @@ describe('timeout', () => {
     it('keeps a user abort as AbortError when a timeout is also set', async () => {
         const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort(), timeout: 1000 }).catch((e) => e)
         expect(error.name).toBe('AbortError')
+    })
+
+    // 2 ** 31 would overflow the timer and abort almost immediately instead of failing
+    it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31])('rejects timeout %s with a RangeError', async (timeout) => {
+        const error = await http.get(`${base}/echo`, { timeout }).catch((e) => e)
+        expect(error).toBeInstanceOf(RangeError)
+        expect(error.message).toBe(`timeout must be an integer from 0 to 2147483647 milliseconds, got ${timeout}`)
+    })
+
+    it('accepts the largest timeout the timer can hold', async () => {
+        expect((await http.get(`${base}/echo`, { timeout: 2 ** 31 - 1 })).method).toBe('GET')
     })
 })
 

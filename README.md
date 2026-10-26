@@ -67,8 +67,8 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | Field | Description |
 | --- | --- |
 | `query` | Query parameters object; see the rules below |
-| `body` | Only for `get` / `delete`; `post` / `put` / `patch` take the body as the second argument |
-| `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
+| `body` | Only for `delete`; `post` / `put` / `patch` take the body as the second argument. `get` cannot send a body, since `fetch` does not allow one on GET |
+| `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`, as an integer from `0` to `2147483647` (about 24.8 days); other values throw a `RangeError` before the request is sent. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
 
 ### Body rules
@@ -79,7 +79,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `FormData`, `URLSearchParams`, `Blob`, `ArrayBuffer`, TypedArray, `ReadableStream`, string | Passed to `fetch` as-is; `fetch` decides the Content-Type |
 | `undefined`, `null` | No body |
 
-A `Content-Type` you set yourself always wins.
+A `Content-Type` you set yourself always wins. A `ReadableStream` is sent with `duplex: 'half'`, which `fetch` requires to stream a request body, so you do not need to set it.
 
 ### Query rules
 

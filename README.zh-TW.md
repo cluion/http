@@ -67,8 +67,8 @@ const users = await http.get<User[]>('/users')
 | 欄位 | 說明 |
 | --- | --- |
 | `query` | 查詢參數物件，見下方規則 |
-| `body` | 只在 `get` / `delete` 使用；`post` / `put` / `patch` 用第二個參數 |
-| `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
+| `body` | 只在 `delete` 使用；`post` / `put` / `patch` 用第二個參數。`get` 不能帶 body，因為 `fetch` 不允許 GET 帶內容 |
+| `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。必須是 `0` 到 `2147483647`（約 24.8 天）的整數，其他值會在送出前丟出 `RangeError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
 | `responseType` | 成功回應的 body 讀取方式：`'json'`、`'text'`、`'blob'`、`'response'`，見「回傳值」 |
 
 ### body 規則
@@ -79,7 +79,7 @@ const users = await http.get<User[]>('/users')
 | `FormData`、`URLSearchParams`、`Blob`、`ArrayBuffer`、TypedArray、`ReadableStream`、字串 | 原樣交給 `fetch`，由 `fetch` 決定 Content-Type |
 | `undefined`、`null` | 不送 body |
 
-自己設定的 `Content-Type` 永遠優先。
+自己設定的 `Content-Type` 永遠優先。`ReadableStream` 會自動帶上 `duplex: 'half'`（`fetch` 串流上傳必填），不需要自己設定。
 
 ### query 規則
 
