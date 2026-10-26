@@ -77,6 +77,7 @@ const users = await http.get<User[]>('/users')
 | `timeout` | 經過幾毫秒後中止請求，丟出原生 `TimeoutError`。必須是 `0` 到 `2147483647`（約 24.8 天）的整數，其他值會在送出前丟出 `RangeError`。涵蓋整個請求，包含讀取 body。不設定就不會逾時，也能和自己的 `signal` 一起使用 |
 | `responseType` | 成功回應的 body 讀取方式：`'json'`、`'text'`、`'blob'`、`'response'`，見「回傳值」 |
 | `hooks` | 在送出前、收到回應時、發生錯誤時執行的函式，見 [hooks](#hooks) |
+| `retry` | 網路錯誤或 503 等狀態碼時自動重試，預設關閉，見[自動重試](#自動重試) |
 
 ### body 規則
 
@@ -162,6 +163,32 @@ const api = http.create({
 - hook 丟出錯誤時，請求會以該錯誤失敗
 - `timeout` 也涵蓋 hooks 和重送的時間
 - 請求設定的 hooks 排在實例的之後執行；`extend` 的 hooks 排在父層之後
+
+### 自動重試
+
+預設不會重試。`retry` 設成數字代表重試次數，要調整更多設定就用物件：
+
+```js
+await http.get('/users', { retry: 2 })
+
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    retry: { limit: 3, statusCodes: [503], delay: (attempt) => 1000 * attempt },
+})
+```
+
+| 欄位 | 預設值 | 說明 |
+| --- | --- | --- |
+| `limit` | `2` | 第一次之後最多再重試幾次 |
+| `methods` | `['GET', 'PUT', 'DELETE']` | `POST`、`PATCH` 不是冪等操作，重送可能重複建立資料，所以要列出來才會重試 |
+| `statusCodes` | `[408, 429, 500, 502, 503, 504]` | 會重試的狀態碼；網路錯誤也會重試 |
+| `delay` | `300`、`600`、`1200`… | `(attempt) => 毫秒`，每次重試前等待的時間，`attempt` 從 1 開始 |
+| `maxRetryAfter` | `60000` | 超過這個時間的 `Retry-After` 不等待 |
+
+- 回應有 `Retry-After` header（秒數或 HTTP 日期）時，改等它指定的時間，不用 `delay`。超過 `maxRetryAfter` 就不重試，直接採用這個回應，所以 429 會立刻丟出 `HttpError`
+- 取消和逾時不會重試；`timeout` 涵蓋所有嘗試和等待的時間。`ReadableStream` 只能讀一次，所以永遠不會重試
+- 每次嘗試都會執行 `onRequest`，所以每次都會讀到當下的 token；`onResponse` 只會收到最後的回應；hook 裡的 `retry()` 也一樣會自動重試
+- 跟其他 options 一樣，請求的 `retry` 會整個取代實例的設定，所以 `retry: 0` 可以只關掉某次請求的重試
 
 ### 回傳值
 

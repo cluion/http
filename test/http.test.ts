@@ -8,8 +8,11 @@ import { HttpError, http } from '../src/index.js'
 // /reply?status=&type=&body= responds with the given status, Content-Type and body
 // /slow?ms=&stage= waits ms before sending the headers, or before finishing the body when stage=body
 // /auth responds 401 unless Authorization is "Bearer fresh", with the received body
+// /flaky?key=&fail=&status=&retryAfter= fails the first `fail` requests for each key, with `status`
+// or a dropped connection when status=drop, then responds with the attempt count, method and body
 let server: Server
 let base: string
+const attempts = new Map<string, number>()
 
 beforeAll(async () => {
     server = createServer(async (req, res) => {
@@ -32,6 +35,26 @@ beforeAll(async () => {
             const ok = req.headers.authorization === 'Bearer fresh'
             res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ ok, body: Buffer.concat(chunks).toString() }))
+            return
+        }
+
+        if (url.pathname === '/flaky') {
+            const key = String(url.searchParams.get('key'))
+            const count = (attempts.get(key) ?? 0) + 1
+            attempts.set(key, count)
+            if (count <= Number(url.searchParams.get('fail'))) {
+                const status = url.searchParams.get('status')
+                if (status === 'drop') {
+                    req.socket.destroy()
+                    return
+                }
+                const retryAfter = url.searchParams.get('retryAfter')
+                res.writeHead(Number(status), retryAfter === null ? {} : { 'retry-after': retryAfter })
+                res.end('failed')
+                return
+            }
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify({ attempts: count, method: req.method, body: Buffer.concat(chunks).toString() }))
             return
         }
 
@@ -578,5 +601,143 @@ describe('hooks', () => {
         await api.get(`${base}/echo`)
         await api.get('http://127.0.0.1:1/').catch(() => {})
         expect(calls).toBe(0)
+    })
+})
+
+describe('retry', () => {
+    let keys = 0
+    // A new key per call, so each request has its own failure count on the server
+    const flaky = (fail: number, status: number | 'drop', extra: Record<string, string> = {}) =>
+        ({ key: `retry-${++keys}`, fail, status, ...extra })
+    const noWait = { delay: () => 0 }
+
+    it('is off by default', async () => {
+        const query = flaky(1, 503)
+        expect((await http.get(`${base}/flaky`, { query }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('retries a retryable status up to the limit, running onRequest on every attempt', async () => {
+        let sends = 0
+        const api = http.create({
+            baseURL: base,
+            timeout: 5000,
+            retry: { limit: 2, ...noWait },
+            hooks: { onRequest: [() => { sends++ }] },
+        })
+        expect(await api.get('/flaky', { query: flaky(2, 503) })).toMatchObject({ attempts: 3 })
+        expect(sends).toBe(3)
+    })
+
+    it('throws the last HttpError once the limit is used up, and onResponse sees only that response', async () => {
+        const seen: number[] = []
+        const api = http.create({
+            baseURL: base,
+            retry: { limit: 2, ...noWait },
+            hooks: { onResponse: [({ response }) => { seen.push(response.status) }] },
+        })
+        const query = flaky(3, 500)
+        expect((await api.get('/flaky', { query }).catch((e) => e)).status).toBe(500)
+        expect(attempts.get(query.key)).toBe(3)
+        expect(seen).toEqual([500])
+    })
+
+    it('a number sets the limit, with the default delay starting at 300ms', async () => {
+        const started = Date.now()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503), retry: 1 })).toMatchObject({ attempts: 2 })
+        expect(Date.now() - started).toBeGreaterThanOrEqual(290)
+    })
+
+    it('retries network errors', async () => {
+        expect(await http.get(`${base}/flaky`, { query: flaky(2, 'drop'), retry: noWait })).toMatchObject({ attempts: 3 })
+    })
+
+    it('does not retry other statuses, or errors thrown by hooks', async () => {
+        const query = flaky(1, 404)
+        expect((await http.get(`${base}/flaky`, { query, retry: noWait }).catch((e) => e)).status).toBe(404)
+        expect(attempts.get(query.key)).toBe(1)
+
+        let calls = 0
+        const buggy = () => {
+            calls++
+            throw new TypeError('bug in a hook')
+        }
+        await expect(http.get(`${base}/echo`, { retry: noWait, hooks: { onRequest: [buggy] } })).rejects.toThrow('bug in a hook')
+        expect(calls).toBe(1)
+    })
+
+    it('retries exactly the statuses listed in statusCodes, even one without a body', async () => {
+        for (const status of [404, 204]) {
+            const retry = { statusCodes: [status], ...noWait }
+            expect(await http.get(`${base}/flaky`, { query: flaky(1, status), retry })).toMatchObject({ attempts: 2 })
+        }
+        const query = flaky(1, 503)
+        expect((await http.get(`${base}/flaky`, { query, retry: { statusCodes: [404], ...noWait } }).catch((e) => e)).status).toBe(503)
+    })
+
+    it('retries POST and PATCH only when listed, sending the body again', async () => {
+        const query = flaky(1, 503)
+        expect((await http.post(`${base}/flaky`, { a: 1 }, { query, retry: noWait }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+
+        const retry = { methods: ['post'], ...noWait }
+        expect(await http.post(`${base}/flaky`, { a: 1 }, { query: flaky(1, 503), retry }))
+            .toEqual({ attempts: 2, method: 'POST', body: '{"a":1}' })
+    })
+
+    it('does not retry a ReadableStream body, which can be read only once', async () => {
+        const query = flaky(1, 503)
+        const error = await http.put(`${base}/flaky`, new Blob(['x']).stream(), { query, retry: noWait }).catch((e) => e)
+        expect(error.status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('waits for Retry-After in seconds instead of the delay', async () => {
+        const started = Date.now()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 429, { retryAfter: '1' }), retry: noWait }))
+            .toMatchObject({ attempts: 2 })
+        expect(Date.now() - started).toBeGreaterThanOrEqual(950)
+    })
+
+    it('reads Retry-After as an HTTP date too, and falls back to the delay when it is invalid', async () => {
+        // With this delay, the test would time out unless Retry-After is used
+        const slow = { delay: () => 60_000 }
+        const past = new Date(Date.now() - 1000).toUTCString()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503, { retryAfter: past }), retry: slow }))
+            .toMatchObject({ attempts: 2 })
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503, { retryAfter: 'soon' }), retry: noWait }))
+            .toMatchObject({ attempts: 2 })
+    })
+
+    it('does not wait for a Retry-After longer than maxRetryAfter', async () => {
+        const query = flaky(1, 429, { retryAfter: '120' })
+        expect((await http.get(`${base}/flaky`, { query, retry: noWait }).catch((e) => e)).status).toBe(429)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('the timeout covers the waits, and an abort stops a wait', async () => {
+        const wait = { delay: () => 1000 }
+        const timedOut = await http.get(`${base}/flaky`, { query: flaky(1, 503), retry: wait, timeout: 100 }).catch((e) => e)
+        expect(timedOut.name).toBe('TimeoutError')
+
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 50)
+        const aborted = await http.get(`${base}/flaky`, { query: flaky(1, 'drop'), retry: wait, signal: controller.signal }).catch((e) => e)
+        expect(aborted.name).toBe('AbortError')
+    })
+
+    it('does not retry an aborted request', async () => {
+        let sends = 0
+        const hooks = { onRequest: [() => { sends++ }] }
+        const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort(), retry: noWait, hooks }).catch((e) => e)
+        expect(error.name).toBe('AbortError')
+        expect(sends).toBe(1)
+    })
+
+    it('a request can turn off the retry of its client', async () => {
+        const api = http.create({ baseURL: base, retry: noWait })
+        const query = flaky(1, 503)
+        expect((await api.get('/flaky', { query, retry: 0 }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
     })
 })

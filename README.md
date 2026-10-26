@@ -77,6 +77,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`, as an integer from `0` to `2147483647` (about 24.8 days); other values throw a `RangeError` before the request is sent. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
 | `hooks` | Functions run before the request, on the response and on errors; see [Hooks](#hooks) |
+| `retry` | Retries network errors and statuses such as 503; off by default. See [Retry](#retry) |
 
 ### Body rules
 
@@ -162,6 +163,32 @@ const api = http.create({
 - An error thrown by a hook rejects the request
 - `timeout` covers the hooks and the retry too
 - Hooks set on a request run after the client's, and `extend` appends its hooks after the parent's
+
+### Retry
+
+Retrying is off by default. Set `retry` to a number of retries, or to an object to change more:
+
+```js
+await http.get('/users', { retry: 2 })
+
+const api = http.create({
+    baseURL: 'https://api.example.com',
+    retry: { limit: 3, statusCodes: [503], delay: (attempt) => 1000 * attempt },
+})
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `limit` | `2` | Retries after the first attempt |
+| `methods` | `['GET', 'PUT', 'DELETE']` | `POST` and `PATCH` are not idempotent and could create a record twice, so they are retried only when listed |
+| `statusCodes` | `[408, 429, 500, 502, 503, 504]` | Statuses that are retried. Network errors are retried too |
+| `delay` | `300`, `600`, `1200`, ... | `(attempt) => milliseconds` to wait before each retry, with `attempt` starting at 1 |
+| `maxRetryAfter` | `60000` | A longer `Retry-After` is not waited for |
+
+- A response with a `Retry-After` header, in seconds or as an HTTP date, is retried after that time instead of `delay`. When it is longer than `maxRetryAfter`, the response is used as is, so a 429 throws `HttpError` right away
+- Aborts and timeouts are not retried, and `timeout` covers every attempt and wait. A `ReadableStream` body can be read only once, so it is never retried
+- `onRequest` hooks run on every attempt, so each one reads the current token. `onResponse` sees only the final response, and a hook's `retry()` gets the same automatic retries
+- Like other options, a request's `retry` replaces the client's, so `retry: 0` turns it off for one request
 
 ### Return value
 

@@ -25,6 +25,21 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'h
     responseType?: ResponseType
     /** Appended to the hooks of the client, which run first. */
     hooks?: Hooks
+    /** Retries network errors and retryable statuses. A number sets `limit`. Off by default. */
+    retry?: number | RetryOptions
+}
+
+export interface RetryOptions {
+    /** Retries after the first attempt. Default 2. */
+    limit?: number
+    /** Default `['GET', 'PUT', 'DELETE']`. POST and PATCH are not idempotent, so they are retried only when listed. */
+    methods?: string[]
+    /** Default `[408, 429, 500, 502, 503, 504]`. */
+    statusCodes?: number[]
+    /** Milliseconds to wait before retry number `attempt`, from 1, when there is no `Retry-After`. Default 300, 600, 1200, ... */
+    delay?: (attempt: number) => number
+    /** A longer `Retry-After` is not waited for, and the response is used as is. Default 60000. */
+    maxRetryAfter?: number
 }
 
 /** Options without `body`: for `get`, which cannot send one, and for methods taking the body as an argument. */
@@ -177,6 +192,46 @@ const merge = (defaults: ClientOptions, options: Options): Merged => ({
     hooks: mergeHooks(defaults.hooks, options.hooks),
 })
 
+const RETRY_DEFAULTS = {
+    limit: 2,
+    methods: ['GET', 'PUT', 'DELETE'],
+    statusCodes: [408, 429, 500, 502, 503, 504],
+    delay: (attempt: number) => 300 * 2 ** (attempt - 1),
+    maxRetryAfter: 60_000,
+}
+
+// A ReadableStream body can be read only once, so such a request is never retried
+function retryPolicy(retry: RequestOptions['retry'], method: string, body: unknown) {
+    if (!retry) return { ...RETRY_DEFAULTS, limit: 0 }
+    const { methods, ...policy } = { ...RETRY_DEFAULTS, ...(typeof retry === 'number' ? { limit: retry } : retry) }
+    const retryable = methods.some((each) => each.toUpperCase() === method) && !(body instanceof ReadableStream)
+    return { ...policy, limit: retryable ? policy.limit : 0 }
+}
+
+/** Milliseconds from a `Retry-After` of delay-seconds or an HTTP date, or undefined when absent or invalid. */
+function retryAfter(response: Response): number | undefined {
+    const value = response.headers.get('retry-after')
+    if (value === null) return undefined
+    const ms = /^\s*\d+\s*$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()
+    return Number.isNaN(ms) ? undefined : Math.max(0, ms)
+}
+
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((resolve, reject) => {
+        const onAbort = () => {
+            clearTimeout(timer)
+            reject(signal.reason)
+        }
+        // Remove the listener once done, so a long-lived signal does not collect them
+        const timer = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort)
+            resolve()
+        }, ms)
+        signal.addEventListener('abort', onAbort, { once: true })
+    })
+}
+
 // Longer delays overflow the timer, and the request aborts almost immediately
 const MAX_TIMEOUT = 2 ** 31 - 1
 
@@ -215,31 +270,52 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
 }
 
 async function request(method: string, url: string, options: Merged): Promise<any> {
-    const { baseURL, query, body, timeout, responseType, headers: headersOption, hooks, ...init } = options
+    const { baseURL, query, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, ...init } = options
     const isJson = body != null && !isNativeBody(body)
     const fullUrl = withQuery(withBase(url, baseURL), query)
-    // Created once, so the timeout also covers the hooks and a retry
+    // Created once, so the timeout also covers the hooks, the waits and every retry
     const signal = withTimeout(init.signal, timeout)
+    const policy = retryPolicy(retryOption, method, body)
     const context = { method, url: fullUrl, headers: new Headers(), options }
 
-    // Each send, a retry included, starts again from the merged URL and headers
-    const send = async () => {
-        const headers = new Headers(headersOption)
-        if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
-        if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
-        context.url = fullUrl
-        context.headers = headers
-        for (const hook of hooks.onRequest) await hook(context)
+    // Each attempt starts again from the merged URL and headers, and runs onRequest
+    const send = async (): Promise<Response> => {
+        for (let attempt = 1; ; attempt++) {
+            const headers = new Headers(headersOption)
+            if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
+            if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
+            context.url = fullUrl
+            context.headers = headers
+            for (const hook of hooks.onRequest) await hook(context)
 
-        return fetch(context.url, {
-            // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
-            ...(body instanceof ReadableStream && { duplex: 'half' }),
-            ...init,
-            method,
-            headers: context.headers,
-            body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
-            signal,
-        })
+            const canRetry = attempt <= policy.limit
+            let response: Response
+            try {
+                response = await fetch(context.url, {
+                    // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
+                    ...(body instanceof ReadableStream && { duplex: 'half' }),
+                    ...init,
+                    method,
+                    headers: context.headers,
+                    body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
+                    signal,
+                })
+            } catch (error) {
+                // fetch rejects with a TypeError when the network fails; aborts and timeouts are not retried
+                if (!canRetry || !(error instanceof TypeError)) throw error
+                await sleep(policy.delay(attempt), signal)
+                continue
+            }
+
+            if (!canRetry || !policy.statusCodes.includes(response.status)) return response
+            const after = retryAfter(response)
+            if (after !== undefined && after > policy.maxRetryAfter) return response
+            // Nothing else reads the discarded response, so free its connection. Cancelling a body
+            // that already failed rejects, which would otherwise be an unhandled rejection
+            /* v8 ignore next */
+            response.body?.cancel().catch(() => {})
+            await sleep(after ?? policy.delay(attempt), signal)
+        }
     }
 
     let retried = false
