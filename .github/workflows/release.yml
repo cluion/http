@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
 
+# Pushing, the version PR, tags and releases use RELEASE_TOKEN, so GITHUB_TOKEN only needs
+# id-token for npm trusted publishing
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
   id-token: write
-  actions: write
 
 concurrency:
   group: release
@@ -33,19 +33,14 @@ jobs:
       - run: pnpm build
 
       # Opens or updates the version PR while changesets are pending; otherwise publishes
-      # any version not yet on npm, then tags it and creates a GitHub release
-      - id: changesets
-        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+      # any version not yet on npm, then tags it and creates a GitHub release.
+      # RELEASE_TOKEN is a maintainer's fine-grained token for this repository only, with
+      # Contents and Pull requests read and write. The version PR and its commit are then
+      # authored by that maintainer, not github-actions[bot], and the PR triggers CI as usual
+      - uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
+          github-token: ${{ secrets.RELEASE_TOKEN }}
           version-script: pnpm changeset version
           publish-script: pnpm changeset publish
           commit-message: 'chore: version packages'
           pr-title: 'chore: version packages'
-
-      # A PR opened with GITHUB_TOKEN does not trigger workflows, but branch protection
-      # requires ci-gate, so run CI on the version PR's branch explicitly
-      - name: Run CI on the version PR
-        if: steps.changesets.outputs.pr-number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "changeset-release/$GITHUB_REF_NAME"
