@@ -57,12 +57,14 @@ const users = await http.get<User[]>('/users')
 | Method | Signature |
 | --- | --- |
 | `http.get` | `(url, options?)` |
+| `http.head` | `(url, options?)` |
+| `http.options` | `(url, options?)` |
 | `http.delete` | `(url, options?)` |
 | `http.post` | `(url, body?, options?)` |
 | `http.put` | `(url, body?, options?)` |
 | `http.patch` | `(url, body?, options?)` |
 
-To send a body with `delete`, use `options.body`: `http.delete('/users', { body: { ids: [1, 2] } })`.
+To send a body with `delete`, use `options.body`: `http.delete('/users', { body: { ids: [1, 2] } })`. A `head` response has no body, so it returns `undefined`; use `responseType: 'response'` to read its headers.
 
 `http` and every client made from it also have `create` and `extend`; see [Instances](#instances).
 
@@ -180,7 +182,7 @@ const api = http.create({
 | Field | Default | Description |
 | --- | --- | --- |
 | `limit` | `2` | Retries after the first attempt |
-| `methods` | `['GET', 'PUT', 'DELETE']` | `POST` and `PATCH` are not idempotent and could create a record twice, so they are retried only when listed |
+| `methods` | `['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']` | `POST` and `PATCH` are not idempotent and could create a record twice, so they are retried only when listed |
 | `statusCodes` | `[408, 429, 500, 502, 503, 504]` | Statuses that are retried. Network errors are retried too |
 | `delay` | `300`, `600`, `1200`, ... | `(attempt) => milliseconds` to wait before each retry, with `attempt` starting at 1 |
 | `maxRetryAfter` | `60000` | A longer `Retry-After` is not waited for |
@@ -219,6 +221,8 @@ response.headers.get('x-total-count')
 const users = await response.json()
 ```
 
+When `responseType` is only known at runtime, such as a variable typed `ResponseType`, the result is typed by the generic, `any` by default.
+
 Non-2xx responses still throw `HttpError` whatever the `responseType`. With `timeout`, reading the body of a `'response'` result counts towards the timeout as well.
 
 ### Errors
@@ -231,7 +235,7 @@ Only **non-2xx responses** throw `HttpError`:
 | `statusText` | e.g. `Not Found` (may be empty over HTTP/2) |
 | `data` | The error body parsed by its Content-Type, whatever the `responseType`; the raw text when it is malformed JSON |
 | `response` | The native `Response` (its body has been read; use `data`) |
-| `message` | e.g. `HTTP 404 Not Found: GET /users` |
+| `message` | e.g. `HTTP 404 Not Found: GET /users`. The query string is left out, since it may hold tokens; `response.url` has the full URL |
 
 Network failures, aborts and timeouts are **not** wrapped in `HttpError`. They stay native errors, so your existing checks keep working:
 

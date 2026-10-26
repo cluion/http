@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
-import { HttpError, http } from '../src/index.js'
+import { HttpError, http, type BodyRequestOptions, type ResponseType } from '../src/index.js'
 
 // A real local server instead of a mocked fetch:
 // /echo, also under any prefix such as /api/echo, responds with the received method, url, headers and body
@@ -109,6 +109,16 @@ describe('HTTP methods', () => {
         const echo = await http.post(`${base}/echo`)
         expect(echo.headers['content-type']).toBeUndefined()
         expect(echo.body).toBe('')
+    })
+
+    it('head returns undefined, and its headers through responseType response', async () => {
+        expect(await http.head(`${base}/echo`)).toBeUndefined()
+        const response = await http.head(`${base}/echo`, { responseType: 'response' })
+        expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8')
+    })
+
+    it('options sends an OPTIONS request', async () => {
+        expect((await http.options(`${base}/echo`)).method).toBe('OPTIONS')
     })
 
     it('delete accepts a body through options.body', async () => {
@@ -224,7 +234,14 @@ describe('errors', () => {
         expect(error.statusText).toBe('Unprocessable Entity')
         expect(error.data).toEqual({ errors: { name: ['The name field is required.'] } })
         expect(error.response).toBeInstanceOf(Response)
-        expect(error.message).toMatch(/^HTTP 422 Unprocessable Entity: GET http:\/\/127\.0\.0\.1:\d+\/reply\?/)
+        // The query is left out of the message, since it may hold tokens
+        expect(error.message).toBe(`HTTP 422 Unprocessable Entity: GET ${base}/reply`)
+        expect(error.response.url).toContain('/reply?status=422')
+    })
+
+    it('leaves the query and fragment out of the message of any HttpError', () => {
+        const error = new HttpError('GET', '/users?token=secret#top', new Response(null, { status: 404 }), undefined)
+        expect(error.message).toBe('HTTP 404: GET /users')
     })
 
     it('keeps the raw text as data when an error body is malformed JSON', async () => {
@@ -330,6 +347,16 @@ describe('responseType', () => {
         expect(await response.json()).toEqual({ a: 1 })
     })
 
+    it('accepts a responseType only known at runtime, and options typed with the exported types', async () => {
+        const read = (responseType: ResponseType) => http.get(`${base}/reply`, { query: replying('text/plain', 'hi'), responseType })
+        expect(await read('text')).toBe('hi')
+        expect(await read('blob')).toBeInstanceOf(Blob)
+
+        const post = (options?: BodyRequestOptions) => http.post(`${base}/echo`, { a: 1 }, options)
+        expect((await post()).body).toBe('{"a":1}')
+        expect(typeof await post({ responseType: 'text' })).toBe('string')
+    })
+
     it('works on methods with a body', async () => {
         const text = await http.post(`${base}/echo`, { a: 1 }, { responseType: 'text' })
         expectTypeOf(text).toEqualTypeOf<string>()
@@ -370,7 +397,7 @@ describe('create and extend', () => {
     it('includes baseURL in the HttpError message', async () => {
         const error = await http.create({ baseURL: base }).get('/reply', { query: { status: 404 } }).catch((e) => e)
         expect(error).toBeInstanceOf(HttpError)
-        expect(error.message).toBe(`HTTP 404 Not Found: GET ${base}/reply?status=404`)
+        expect(error.message).toBe(`HTTP 404 Not Found: GET ${base}/reply`)
     })
 
     it('merges headers per name, and null or undefined drops a default', async () => {
@@ -724,6 +751,14 @@ describe('retry', () => {
         setTimeout(() => controller.abort(), 50)
         const aborted = await http.get(`${base}/flaky`, { query: flaky(1, 'drop'), retry: wait, signal: controller.signal }).catch((e) => e)
         expect(aborted.name).toBe('AbortError')
+    })
+
+    it('retries HEAD and OPTIONS by default', async () => {
+        for (const method of ['head', 'options'] as const) {
+            const query = flaky(1, 503)
+            await http[method](`${base}/flaky`, { query, retry: noWait })
+            expect(attempts.get(query.key)).toBe(2)
+        }
     })
 
     it('does not retry an aborted request', async () => {

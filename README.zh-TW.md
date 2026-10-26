@@ -57,12 +57,14 @@ const users = await http.get<User[]>('/users')
 | 方法 | 簽章 |
 | --- | --- |
 | `http.get` | `(url, options?)` |
+| `http.head` | `(url, options?)` |
+| `http.options` | `(url, options?)` |
 | `http.delete` | `(url, options?)` |
 | `http.post` | `(url, body?, options?)` |
 | `http.put` | `(url, body?, options?)` |
 | `http.patch` | `(url, body?, options?)` |
 
-`delete` 需要帶內容時用 `options.body`：`http.delete('/users', { body: { ids: [1, 2] } })`。
+`delete` 需要帶內容時用 `options.body`：`http.delete('/users', { body: { ids: [1, 2] } })`。`head` 的回應沒有 body，所以會回傳 `undefined`；要讀 headers 請用 `responseType: 'response'`。
 
 `http` 和由它建立的每個實例也都有 `create`、`extend`，見[實例](#實例)。
 
@@ -180,7 +182,7 @@ const api = http.create({
 | 欄位 | 預設值 | 說明 |
 | --- | --- | --- |
 | `limit` | `2` | 第一次之後最多再重試幾次 |
-| `methods` | `['GET', 'PUT', 'DELETE']` | `POST`、`PATCH` 不是冪等操作，重送可能重複建立資料，所以要列出來才會重試 |
+| `methods` | `['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']` | `POST`、`PATCH` 不是冪等操作，重送可能重複建立資料，所以要列出來才會重試 |
 | `statusCodes` | `[408, 429, 500, 502, 503, 504]` | 會重試的狀態碼；網路錯誤也會重試 |
 | `delay` | `300`、`600`、`1200`… | `(attempt) => 毫秒`，每次重試前等待的時間，`attempt` 從 1 開始 |
 | `maxRetryAfter` | `60000` | 超過這個時間的 `Retry-After` 不等待 |
@@ -219,6 +221,8 @@ response.headers.get('x-total-count')
 const users = await response.json()
 ```
 
+`responseType` 要到執行時才知道時（例如型別是 `ResponseType` 的變數），回傳型別由泛型決定，預設為 `any`。
+
 不管 `responseType` 是什麼，非 2xx 回應都會丟出 `HttpError`。有設定 `timeout` 時，讀取 `'response'` 的 body 也算在逾時時間內。
 
 ### 錯誤
@@ -231,7 +235,7 @@ const users = await response.json()
 | `statusText` | 例如 `Not Found`（HTTP/2 可能為空字串） |
 | `data` | 依 Content-Type 解析的錯誤內容（與 `responseType` 無關）；JSON 壞掉時為原始文字 |
 | `response` | 原生 `Response`（body 已讀取，請改用 `data`） |
-| `message` | 例如 `HTTP 404 Not Found: GET /users` |
+| `message` | 例如 `HTTP 404 Not Found: GET /users`。不包含 query，因為 query 可能帶有 token；完整網址在 `response.url` |
 
 網路斷線、取消、逾時 **不會** 包成 `HttpError`，維持原生錯誤，原本的判斷方式都能用：
 

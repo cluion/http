@@ -32,7 +32,7 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'h
 export interface RetryOptions {
     /** Retries after the first attempt. Default 2. */
     limit?: number
-    /** Default `['GET', 'PUT', 'DELETE']`. POST and PATCH are not idempotent, so they are retried only when listed. */
+    /** Default `['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']`. POST and PATCH are not idempotent, so they are retried only when listed. */
     methods?: string[]
     /** Default `[408, 429, 500, 502, 503, 504]`. */
     statusCodes?: number[]
@@ -47,18 +47,19 @@ export type BodyRequestOptions = Omit<RequestOptions, 'body'>
 
 type Typed<O, R extends ResponseType> = O & { responseType: R }
 
+// The last overload also takes 'json', and a responseType only known at runtime, typed as T
 interface MethodWithoutBody<O> {
     (url: string, options: Typed<O, 'text'>): Promise<string>
     (url: string, options: Typed<O, 'blob'>): Promise<Blob>
     (url: string, options: Typed<O, 'response'>): Promise<Response>
-    <T = any>(url: string, options?: O & { responseType?: 'json' }): Promise<T>
+    <T = any>(url: string, options?: O): Promise<T>
 }
 
 interface MethodWithBody {
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'text'>): Promise<string>
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'blob'>): Promise<Blob>
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'response'>): Promise<Response>
-    <T = any>(url: string, body?: unknown, options?: BodyRequestOptions & { responseType?: 'json' }): Promise<T>
+    <T = any>(url: string, body?: unknown, options?: BodyRequestOptions): Promise<T>
 }
 
 /** Defaults for every request of a client. `headers` and `query` merge per key, `hooks` are appended, other options are replaced. */
@@ -97,6 +98,9 @@ export interface Hooks {
 
 export interface HttpClient {
     get: MethodWithoutBody<BodyRequestOptions>
+    /** A HEAD response has no body; use `responseType: 'response'` to read its headers. */
+    head: MethodWithoutBody<BodyRequestOptions>
+    options: MethodWithoutBody<BodyRequestOptions>
     delete: MethodWithoutBody<RequestOptions>
     post: MethodWithBody
     put: MethodWithBody
@@ -117,8 +121,9 @@ export class HttpError<T = any> extends Error {
     /** Its body has already been read; use `data` instead. */
     readonly response: Response
 
+    /** The message leaves out the query and fragment of `url`, which may hold tokens; `response.url` has the full URL. */
     constructor(method: string, url: string, response: Response, data: T) {
-        super(`HTTP ${`${response.status} ${response.statusText}`.trim()}: ${method} ${url}`)
+        super(`HTTP ${`${response.status} ${response.statusText}`.trim()}: ${method} ${url.replace(/[?#].*$/s, '')}`)
         this.status = response.status
         this.statusText = response.statusText
         this.data = data
@@ -194,7 +199,7 @@ const merge = (defaults: ClientOptions, options: Options): Merged => ({
 
 const RETRY_DEFAULTS = {
     limit: 2,
-    methods: ['GET', 'PUT', 'DELETE'],
+    methods: ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'],
     statusCodes: [408, 429, 500, 502, 503, 504],
     delay: (attempt: number) => 300 * 2 ** (attempt - 1),
     maxRetryAfter: 60_000,
@@ -357,6 +362,8 @@ function client(defaults: ClientOptions): HttpClient {
 
     return {
         get: withoutBody('GET'),
+        head: withoutBody('HEAD'),
+        options: withoutBody('OPTIONS'),
         delete: withoutBody('DELETE'),
         post: withBody('POST'),
         put: withBody('PUT'),
