@@ -1,7 +1,10 @@
 export type QueryValue = string | number | boolean | null | undefined
 
-/** Arrays serialize as `key[]=a&key[]=b`; null and undefined are skipped. */
+/** Arrays serialize as `key[]=a&key[]=b` unless `queryArrayFormat` says otherwise; null and undefined are skipped. */
 export type Query = Record<string, QueryValue | readonly QueryValue[]>
+
+/** `ids[]=1&ids[]=2` (PHP, Rails, Express), `ids=1&ids=2` (FastAPI, Spring, Go) or `ids=1,2`. */
+export type QueryArrayFormat = 'brackets' | 'repeat' | 'comma'
 
 /**
  * How a successful body is read. When omitted, JSON Content-Types are parsed,
@@ -15,6 +18,8 @@ export type HeadersOption = HeadersInit | Record<string, string | null | undefin
 export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'headers'> {
     headers?: HeadersOption
     query?: Query
+    /** How arrays in `query` are serialized. Default `'brackets'`. */
+    queryArrayFormat?: QueryArrayFormat
     /** Plain objects and arrays are sent as JSON; native bodies (FormData, Blob, string, ...) are sent as-is. */
     body?: unknown
     /**
@@ -144,12 +149,18 @@ const isNativeBody = (body: unknown): body is BodyInit =>
     || ArrayBuffer.isView(body)
     || body instanceof ReadableStream
 
-function withQuery(url: string, query: Query = {}): string {
+function withQuery(url: string, query: Query = {}, format: QueryArrayFormat = 'brackets'): string {
     const params = new URLSearchParams()
     for (const [key, value] of Object.entries(query)) {
-        const name = Array.isArray(value) ? `${key}[]` : key
-        for (const item of Array.isArray(value) ? value : [value]) {
-            if (item != null) params.append(name, String(item))
+        if (!Array.isArray(value)) {
+            if (value != null) params.append(key, String(value))
+            continue
+        }
+        const items = value.filter((item) => item != null).map(String)
+        if (format === 'comma') {
+            if (items.length) params.append(key, items.join(','))
+        } else {
+            for (const item of items) params.append(format === 'repeat' ? key : `${key}[]`, item)
         }
     }
     const search = params.toString()
@@ -275,9 +286,11 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
 }
 
 async function request(method: string, url: string, options: Merged): Promise<any> {
-    const { baseURL, query, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, ...init } = options
+    const {
+        baseURL, query, queryArrayFormat, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, ...init
+    } = options
     const isJson = body != null && !isNativeBody(body)
-    const fullUrl = withQuery(withBase(url, baseURL), query)
+    const fullUrl = withQuery(withBase(url, baseURL), query, queryArrayFormat)
     // Created once, so the timeout also covers the hooks, the waits and every retry
     const signal = withTimeout(init.signal, timeout)
     const policy = retryPolicy(retryOption, method, body)

@@ -198,6 +198,27 @@ describe('query', () => {
     it('appends to an existing query string', async () => {
         expect(await urlOf('/echo?sort=name', { query: { page: 2 } })).toBe('/echo?sort=name&page=2')
     })
+
+    it.each([
+        ['brackets', '/echo?ids[]=1&ids[]=2&page=1'],
+        ['repeat', '/echo?ids=1&ids=2&page=1'],
+        ['comma', '/echo?ids=1,2&page=1'],
+    ] as const)('queryArrayFormat %s', async (queryArrayFormat, expected) => {
+        expect(await urlOf('/echo', { query: { ids: [1, null, 2], page: 1 }, queryArrayFormat })).toBe(expected)
+    })
+
+    it('skips an empty or all-null array in every format', async () => {
+        for (const queryArrayFormat of ['brackets', 'repeat', 'comma'] as const) {
+            expect(await urlOf('/echo', { query: { a: [], b: [null], c: 'x' }, queryArrayFormat })).toBe('/echo?c=x')
+        }
+    })
+
+    it('takes queryArrayFormat as a client default, which a request can replace', async () => {
+        const api = http.create({ baseURL: base, queryArrayFormat: 'repeat' })
+        expect(decodeURIComponent((await api.get('/echo', { query: { ids: [1, 2] } })).url)).toBe('/echo?ids=1&ids=2')
+        expect(decodeURIComponent((await api.get('/echo', { query: { ids: [1, 2] }, queryArrayFormat: 'comma' })).url))
+            .toBe('/echo?ids=1,2')
+    })
 })
 
 describe('response parsing', () => {

@@ -75,6 +75,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | Field | Description |
 | --- | --- |
 | `query` | Query parameters object; see the rules below |
+| `queryArrayFormat` | How arrays in `query` are serialized: `'brackets'` (default), `'repeat'` or `'comma'` |
 | `body` | Only for `delete`; `post` / `put` / `patch` take the body as the second argument. `get` cannot send a body, since `fetch` does not allow one on GET |
 | `timeout` | Milliseconds before the request is aborted with a native `TimeoutError`, as an integer from `0` to `2147483647` (about 24.8 days); other values throw a `RangeError` before the request is sent. Covers the whole request, including reading the body. No timeout when omitted. It works together with your own `signal` |
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
@@ -99,6 +100,7 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 ```
 
 - Arrays serialize as `key[]=value` (same as axios; PHP / Laravel, Rails and Express parse it as an array)
+- For backends that expect another format, set `queryArrayFormat` to `'repeat'` for `ids=1&ids=2` (FastAPI, Spring, Go) or to `'comma'` for `ids=1,2`. It also works as a client default
 - `null` and `undefined` are skipped
 - Appended with `&` when the URL already has a `?`
 - Values must be strings, numbers or booleans; nested objects are not supported
