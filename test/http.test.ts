@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { HttpError, http, type BodyRequestOptions, type ResponseType } from '../src/index.js'
 
 // A real local server instead of a mocked fetch:
@@ -795,5 +795,70 @@ describe('retry', () => {
         const query = flaky(1, 503)
         expect((await api.get('/flaky', { query, retry: 0 }).catch((e) => e)).status).toBe(503)
         expect(attempts.get(query.key)).toBe(1)
+    })
+})
+
+describe('xsrf', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals()
+    })
+
+    // Pretends to run in a browser page on `origin` that has these cookies
+    const page = (origin: string, cookie: string) => {
+        vi.stubGlobal('document', { cookie })
+        vi.stubGlobal('location', new URL(`${origin}/page`))
+    }
+    // Laravel URL-encodes the cookie value
+    const cookie = 'XSRF-TOKEN=eyJpdiI6IjEyMyJ9%3D'
+    const token = 'eyJpdiI6IjEyMyJ9='
+
+    it('is off by default', async () => {
+        page(base, cookie)
+        expect((await http.get(`${base}/echo`)).headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends the decoded cookie as X-XSRF-TOKEN on same-origin requests', async () => {
+        page(base, `other=1; ${cookie}; more=2`)
+        const api = http.create({ baseURL: base, xsrf: true })
+        expect((await api.get('/echo')).headers['x-xsrf-token']).toBe(token)
+        expect((await api.post('/echo', { a: 1 })).headers['x-xsrf-token']).toBe(token)
+    })
+
+    it('never sends it to another origin, even when an onRequest hook changes the URL', async () => {
+        page('http://example.com', cookie)
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+
+        // The request starts on the page's origin, and the hook moves it to another one
+        const echo = await http.get('http://example.com/api', {
+            xsrf: true,
+            hooks: { onRequest: [(context) => { context.url = `${base}/echo` }] },
+        })
+        expect(echo.headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends it to the listed origins too, such as an API on a subdomain', async () => {
+        page('http://app.example.com', cookie)
+        const echo = await http.get(`${base}/echo`, { xsrf: { origins: ['http://other.example.com', `${base}/`] } })
+        expect(echo.headers['x-xsrf-token']).toBe(token)
+    })
+
+    it('takes custom cookie and header names, and keeps a header set by hand', async () => {
+        page(base, 'csrf=abc')
+        const xsrf = { cookieName: 'csrf', headerName: 'X-CSRF-Token' }
+        expect((await http.get(`${base}/echo`, { xsrf })).headers['x-csrf-token']).toBe('abc')
+        const mine = await http.get(`${base}/echo`, { xsrf, headers: { 'X-CSRF-Token': 'mine' } })
+        expect(mine.headers['x-csrf-token']).toBe('mine')
+    })
+
+    it('sends nothing without the cookie, or outside a browser', async () => {
+        page(base, 'XSRF-TOKEN-OLD=1; other=2')
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+        vi.unstubAllGlobals()
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends a malformed cookie as it is instead of failing the request', async () => {
+        page(base, 'XSRF-TOKEN=%E0%A4%A')
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBe('%E0%A4%A')
     })
 })

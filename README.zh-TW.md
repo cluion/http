@@ -81,6 +81,7 @@ const users = await http.get<User[]>('/users')
 | `responseType` | 成功回應的 body 讀取方式：`'json'`、`'text'`、`'blob'`、`'response'`，見「回傳值」 |
 | `hooks` | 在送出前、收到回應時、發生錯誤時執行的函式，見 [hooks](#hooks) |
 | `retry` | 網路錯誤或 503 等狀態碼時自動重試，預設關閉，見[自動重試](#自動重試) |
+| `xsrf` | 在瀏覽器把 `XSRF-TOKEN` cookie 帶成 `X-XSRF-TOKEN` header，預設關閉，見 [XSRF](#xsrf) |
 
 ### body 規則
 
@@ -108,6 +109,29 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 ### headers
 
 預設帶 `Accept: application/json, text/plain, */*`（與 axios 相同）。Laravel 依這個 header 判斷要回傳 JSON 驗證錯誤，而不是重新導向。自己設定的 `Accept` 會覆蓋預設值。值為 `null` 或 `undefined` 的 header 不會送出。
+
+### XSRF
+
+Laravel Sanctum 這類以 cookie 驗證的後端，需要把 `XSRF-TOKEN` cookie 帶回成 `X-XSRF-TOKEN` header，axios 會自動處理。開啟 `xsrf` 就有同樣的效果：
+
+```js
+const api = http.create({ baseURL: '/api', xsrf: true })
+
+await http.get('/sanctum/csrf-cookie')   // 設定 XSRF-TOKEN cookie
+await api.post('/login', { email, password })
+
+// API 在其他子網域：列出它的來源，並用 credentials 帶上 cookie
+const remote = http.create({
+    baseURL: 'https://api.example.com',
+    credentials: 'include',
+    xsrf: { origins: ['https://api.example.com'] },
+})
+```
+
+- token 只會送給頁面本身的來源和 `origins` 列出的來源，不會外洩到其他網站。判斷依據是 `onRequest` hooks 執行後的最終網址
+- 每次請求都會重新讀取 cookie 並做 URL 解碼；沒有 cookie 就不送。自己設定的 header 會保留
+- 在瀏覽器以外沒有 `document.cookie`，所以不會有任何作用
+- `cookieName`、`headerName` 可以改掉預設的 `'XSRF-TOKEN'`、`'X-XSRF-TOKEN'`
 
 ### 實例
 

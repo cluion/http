@@ -81,6 +81,7 @@ Apart from the fields below, every native [`RequestInit`](https://developer.mozi
 | `responseType` | How a successful body is read: `'json'`, `'text'`, `'blob'` or `'response'`; see Return value |
 | `hooks` | Functions run before the request, on the response and on errors; see [Hooks](#hooks) |
 | `retry` | Retries network errors and statuses such as 503; off by default. See [Retry](#retry) |
+| `xsrf` | Sends the `XSRF-TOKEN` cookie as `X-XSRF-TOKEN` in browsers; off by default. See [XSRF](#xsrf) |
 
 ### Body rules
 
@@ -108,6 +109,29 @@ http.get('/users', { query: { page: 1, q: 'a b', ids: [1, 2], role: null } })
 ### Headers
 
 `Accept: application/json, text/plain, */*` is sent by default (same as axios). Laravel uses this header to return JSON validation errors instead of redirecting. An `Accept` you set yourself replaces the default. A header set to `null` or `undefined` is not sent.
+
+### XSRF
+
+Cookie-based authentication such as Laravel Sanctum expects the `XSRF-TOKEN` cookie to come back as the `X-XSRF-TOKEN` header, which axios adds for you. Turn on `xsrf` to do the same:
+
+```js
+const api = http.create({ baseURL: '/api', xsrf: true })
+
+await http.get('/sanctum/csrf-cookie')   // sets the XSRF-TOKEN cookie
+await api.post('/login', { email, password })
+
+// An API on another subdomain: list its origin, and send cookies with credentials
+const remote = http.create({
+    baseURL: 'https://api.example.com',
+    credentials: 'include',
+    xsrf: { origins: ['https://api.example.com'] },
+})
+```
+
+- The token is sent only to the page's own origin and to the listed `origins`, so it never reaches another site. The check uses the final URL, after `onRequest` hooks
+- The cookie is read again on every request, URL-decoded, and skipped when it is missing. A header you set yourself is kept
+- It does nothing outside a browser, where there is no `document.cookie`
+- `cookieName` and `headerName` change the defaults, `'XSRF-TOKEN'` and `'X-XSRF-TOKEN'`
 
 ### Instances
 

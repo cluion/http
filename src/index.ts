@@ -32,6 +32,20 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'h
     hooks?: Hooks
     /** Retries network errors and retryable statuses. A number sets `limit`. Off by default. */
     retry?: number | RetryOptions
+    /**
+     * In browsers, sends the `XSRF-TOKEN` cookie as the `X-XSRF-TOKEN` header, as Laravel Sanctum expects.
+     * Only the page's own origin and the listed `origins` get it, so the token never reaches another site. Off by default.
+     */
+    xsrf?: boolean | XsrfOptions
+}
+
+export interface XsrfOptions {
+    /** Default `'XSRF-TOKEN'`. */
+    cookieName?: string
+    /** Default `'X-XSRF-TOKEN'`. */
+    headerName?: string
+    /** Other origins that may get the token, such as `'https://api.example.com'` for an API on a subdomain. */
+    origins?: string[]
 }
 
 export interface RetryOptions {
@@ -248,6 +262,24 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
     })
 }
 
+/** Adds the XSRF header from its cookie, unless already set, the origin is not allowed or there is no document. */
+function addXsrf(headers: Headers, url: string, xsrf: boolean | XsrfOptions = false) {
+    if (!xsrf || typeof document === 'undefined') return
+    const { cookieName = 'XSRF-TOKEN', headerName = 'X-XSRF-TOKEN', origins = [] } = xsrf === true ? {} : xsrf
+    const allowed = [location.origin, ...origins.map((each) => new URL(each).origin)]
+    if (headers.has(headerName) || !allowed.includes(new URL(url, location.href).origin)) return
+
+    const cookie = document.cookie.split('; ').find((each) => each.startsWith(`${cookieName}=`))
+    if (!cookie) return
+    const value = cookie.slice(cookieName.length + 1)
+    // A malformed cookie is sent as it is, rather than failing every request
+    try {
+        headers.set(headerName, decodeURIComponent(value))
+    } catch {
+        headers.set(headerName, value)
+    }
+}
+
 // Longer delays overflow the timer, and the request aborts almost immediately
 const MAX_TIMEOUT = 2 ** 31 - 1
 
@@ -287,7 +319,8 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
 
 async function request(method: string, url: string, options: Merged): Promise<any> {
     const {
-        baseURL, query, queryArrayFormat, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, ...init
+        baseURL, query, queryArrayFormat, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, xsrf,
+        ...init
     } = options
     const isJson = body != null && !isNativeBody(body)
     const fullUrl = withQuery(withBase(url, baseURL), query, queryArrayFormat)
@@ -305,6 +338,8 @@ async function request(method: string, url: string, options: Merged): Promise<an
             context.url = fullUrl
             context.headers = headers
             for (const hook of hooks.onRequest) await hook(context)
+            // After the hooks, since one may point the URL at another origin
+            addXsrf(context.headers, context.url, xsrf)
 
             const canRetry = attempt <= policy.limit
             let response: Response
