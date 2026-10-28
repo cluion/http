@@ -192,6 +192,27 @@ const api = http.create({
 - `timeout` 也涵蓋 hooks 和重送的時間
 - 請求設定的 hooks 排在實例的之後執行；`extend` 的 hooks 排在父層之後
 
+#### 多個請求只刷新一次 token
+
+多個請求同時收到 401 時，上面的範例會讓每個請求各刷新一次 token。改成共用同一次刷新；用舊 token 送出的請求代表別的請求已經刷新過，直接重送即可：
+
+```js
+let refreshing = null
+const refresh = () => (refreshing ??= refreshToken().finally(() => { refreshing = null }))
+
+const api = http.create({
+    hooks: {
+        onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${store.token}`)],
+        onResponse: [async ({ response, headers, retry }) => {
+            if (response.status !== 401) return
+            // 只有用目前的 token 送出時才刷新；用舊 token 送出的直接重送
+            if (headers.get('Authorization') === `Bearer ${store.token}`) await refresh()
+            return retry()
+        }],
+    },
+})
+```
+
 ### 自動重試
 
 預設不會重試。`retry` 設成數字代表重試次數，要調整更多設定就用物件：

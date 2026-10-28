@@ -582,6 +582,39 @@ describe('hooks', () => {
         expect(refreshes).toBe(1)
     })
 
+    it('concurrent requests can share one token refresh, as the README shows', async () => {
+        let token = 'stale'
+        let refreshes = 0
+        let refreshing: Promise<void> | null = null
+        const refreshToken = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20))
+            refreshes++
+            token = 'fresh'
+        }
+        const refresh = () => (refreshing ??= refreshToken().finally(() => { refreshing = null }))
+
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${token}`)],
+                onResponse: [async ({ response, headers, retry }) => {
+                    if (response.status !== 401) return
+                    // Refresh only if it used the current token; one sent with an older token just goes again
+                    if (headers.get('Authorization') === `Bearer ${token}`) await refresh()
+                    return retry()
+                }],
+            },
+        })
+        const results = await Promise.all([api.get('/auth'), api.get('/auth'), api.get('/auth')])
+        expect(results.map((result) => result.ok)).toEqual([true, true, true])
+        expect(refreshes).toBe(1)
+
+        // A later 401 is refreshed again
+        token = 'expired'
+        expect((await api.get('/auth')).ok).toBe(true)
+        expect(refreshes).toBe(2)
+    })
+
     it('does not run onResponse again on the retried response', async () => {
         let calls = 0
         const api = http.create({ baseURL: base, hooks: { onResponse: [({ retry }) => { calls++; return retry() }] } })

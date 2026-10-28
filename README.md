@@ -192,6 +192,27 @@ const api = http.create({
 - `timeout` covers the hooks and the retry too
 - Hooks set on a request run after the client's, and `extend` appends its hooks after the parent's
 
+#### Refreshing a token once for many requests
+
+When several requests get a 401 at the same time, the example above refreshes the token once for each of them. Share one refresh instead, and skip it for a request that was sent with an older token, since another request has already refreshed it:
+
+```js
+let refreshing = null
+const refresh = () => (refreshing ??= refreshToken().finally(() => { refreshing = null }))
+
+const api = http.create({
+    hooks: {
+        onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${store.token}`)],
+        onResponse: [async ({ response, headers, retry }) => {
+            if (response.status !== 401) return
+            // Refresh only if it used the current token; one sent with an older token just goes again
+            if (headers.get('Authorization') === `Bearer ${store.token}`) await refresh()
+            return retry()
+        }],
+    },
+})
+```
+
 ### Retry
 
 Retrying is off by default. Set `retry` to a number of retries, or to an object to change more:
