@@ -1,7 +1,10 @@
 export type QueryValue = string | number | boolean | null | undefined
 
-/** Arrays serialize as `key[]=a&key[]=b`; null and undefined are skipped. */
+/** Arrays serialize as `key[]=a&key[]=b` unless `queryArrayFormat` says otherwise; null and undefined are skipped. */
 export type Query = Record<string, QueryValue | readonly QueryValue[]>
+
+/** `ids[]=1&ids[]=2` (PHP, Rails, Express), `ids=1&ids=2` (FastAPI, Spring, Go) or `ids=1,2`. */
+export type QueryArrayFormat = 'brackets' | 'repeat' | 'comma'
 
 /**
  * How a successful body is read. When omitted, JSON Content-Types are parsed,
@@ -9,8 +12,14 @@ export type Query = Record<string, QueryValue | readonly QueryValue[]>
  */
 export type ResponseType = 'json' | 'text' | 'blob' | 'response'
 
-export interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
+/** Like `HeadersInit`, but a null or undefined value is not sent and drops a client default. */
+export type HeadersOption = HeadersInit | Record<string, string | null | undefined>
+
+export interface RequestOptions extends Omit<RequestInit, 'method' | 'body' | 'headers'> {
+    headers?: HeadersOption
     query?: Query
+    /** How arrays in `query` are serialized. Default `'brackets'`. */
+    queryArrayFormat?: QueryArrayFormat
     /** Plain objects and arrays are sent as JSON; native bodies (FormData, Blob, string, ...) are sent as-is. */
     body?: unknown
     /**
@@ -19,6 +28,37 @@ export interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
      */
     timeout?: number
     responseType?: ResponseType
+    /** Appended to the hooks of the client, which run first. */
+    hooks?: Hooks
+    /** Retries network errors and retryable statuses. A number sets `limit`. Off by default. */
+    retry?: number | RetryOptions
+    /**
+     * In browsers, sends the `XSRF-TOKEN` cookie as the `X-XSRF-TOKEN` header, as Laravel Sanctum expects.
+     * Only the page's own origin and the listed `origins` get it, so the token never reaches another site. Off by default.
+     */
+    xsrf?: boolean | XsrfOptions
+}
+
+export interface XsrfOptions {
+    /** Default `'XSRF-TOKEN'`. */
+    cookieName?: string
+    /** Default `'X-XSRF-TOKEN'`. */
+    headerName?: string
+    /** Other origins that may get the token, such as `'https://api.example.com'` for an API on a subdomain. */
+    origins?: string[]
+}
+
+export interface RetryOptions {
+    /** Retries after the first attempt. Default 2. */
+    limit?: number
+    /** Default `['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']`. POST and PATCH are not idempotent, so they are retried only when listed. */
+    methods?: string[]
+    /** Default `[408, 429, 500, 502, 503, 504]`. */
+    statusCodes?: number[]
+    /** Milliseconds to wait before retry number `attempt`, from 1, when there is no `Retry-After`. Default 300, 600, 1200, ... */
+    delay?: (attempt: number) => number
+    /** A longer `Retry-After` is not waited for, and the response is used as is. Default 60000. */
+    maxRetryAfter?: number
 }
 
 /** Options without `body`: for `get`, which cannot send one, and for methods taking the body as an argument. */
@@ -26,18 +66,68 @@ export type BodyRequestOptions = Omit<RequestOptions, 'body'>
 
 type Typed<O, R extends ResponseType> = O & { responseType: R }
 
+// The last overload also takes 'json', and a responseType only known at runtime, typed as T
 interface MethodWithoutBody<O> {
     (url: string, options: Typed<O, 'text'>): Promise<string>
     (url: string, options: Typed<O, 'blob'>): Promise<Blob>
     (url: string, options: Typed<O, 'response'>): Promise<Response>
-    <T = any>(url: string, options?: O & { responseType?: 'json' }): Promise<T>
+    <T = any>(url: string, options?: O): Promise<T>
 }
 
 interface MethodWithBody {
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'text'>): Promise<string>
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'blob'>): Promise<Blob>
     (url: string, body: unknown, options: Typed<BodyRequestOptions, 'response'>): Promise<Response>
-    <T = any>(url: string, body?: unknown, options?: BodyRequestOptions & { responseType?: 'json' }): Promise<T>
+    <T = any>(url: string, body?: unknown, options?: BodyRequestOptions): Promise<T>
+}
+
+/** Defaults for every request of a client. `headers` and `query` merge per key, `hooks` are appended, other options are replaced. */
+export interface ClientOptions extends Omit<RequestOptions, 'body' | 'responseType'> {
+    /** Joined to relative URLs; absolute (`https://...`) and protocol-relative (`//host`) URLs are used as-is. */
+    baseURL?: string
+}
+
+export interface RequestContext {
+    readonly method: string
+    /** The URL to request, with `baseURL` and `query` applied. `onRequest` hooks may replace it. */
+    url: string
+    /** The headers to send. `onRequest` hooks may change them. */
+    readonly headers: Headers
+    /** The options of the request, merged with the client's. */
+    readonly options: Readonly<RequestOptions & ClientOptions>
+}
+
+export interface ResponseContext extends RequestContext {
+    /** The native `Response`, with its body unread. */
+    readonly response: Response
+    /** Sends the request again, running the `onRequest` hooks first, and resolves with the new response. Once per request. */
+    retry(): Promise<Response>
+}
+
+type Awaitable<T> = T | Promise<T>
+
+export interface Hooks {
+    /** Run before each send, including a retry. */
+    onRequest?: ((context: RequestContext) => Awaitable<void>)[]
+    /** Run for every status before the body is read. A returned `Response` replaces the current one. */
+    onResponse?: ((context: ResponseContext) => Awaitable<Response | void>)[]
+    /** Run before an `HttpError` is thrown, each with that error. The last `Error` returned is thrown instead. */
+    onError?: ((error: HttpError) => Awaitable<Error | void>)[]
+}
+
+export interface HttpClient {
+    get: MethodWithoutBody<BodyRequestOptions>
+    /** A HEAD response has no body; use `responseType: 'response'` to read its headers. */
+    head: MethodWithoutBody<BodyRequestOptions>
+    options: MethodWithoutBody<BodyRequestOptions>
+    delete: MethodWithoutBody<RequestOptions>
+    post: MethodWithBody
+    put: MethodWithBody
+    patch: MethodWithBody
+    /** A new client with these defaults only, without inheriting this client's. */
+    create(defaults?: ClientOptions): HttpClient
+    /** A new client with these defaults merged into this client's, which stay unchanged. */
+    extend(defaults: ClientOptions): HttpClient
 }
 
 /** A non-2xx response. Network errors, aborts and timeouts stay native (TypeError / AbortError / TimeoutError). */
@@ -50,8 +140,9 @@ export class HttpError<T = any> extends Error {
     /** Its body has already been read; use `data` instead. */
     readonly response: Response
 
+    /** The message leaves out the query and fragment of `url`, which may hold tokens; `response.url` has the full URL. */
     constructor(method: string, url: string, response: Response, data: T) {
-        super(`HTTP ${`${response.status} ${response.statusText}`.trim()}: ${method} ${url}`)
+        super(`HTTP ${`${response.status} ${response.statusText}`.trim()}: ${method} ${url.replace(/[?#].*$/s, '')}`)
         this.status = response.status
         this.statusText = response.statusText
         this.data = data
@@ -72,18 +163,121 @@ const isNativeBody = (body: unknown): body is BodyInit =>
     || ArrayBuffer.isView(body)
     || body instanceof ReadableStream
 
-function withQuery(url: string, query: Query = {}): string {
+function withQuery(url: string, query: Query = {}, format: QueryArrayFormat = 'brackets'): string {
     const params = new URLSearchParams()
     for (const [key, value] of Object.entries(query)) {
-        const name = Array.isArray(value) ? `${key}[]` : key
-        for (const item of Array.isArray(value) ? value : [value]) {
-            if (item != null) params.append(name, String(item))
+        if (!Array.isArray(value)) {
+            if (value != null) params.append(key, String(value))
+            continue
+        }
+        const items = value.filter((item) => item != null).map(String)
+        if (format === 'comma') {
+            if (items.length) params.append(key, items.join(','))
+        } else {
+            for (const item of items) params.append(format === 'repeat' ? key : `${key}[]`, item)
         }
     }
     const search = params.toString()
     if (!search) return url
     const path = url.split('#')[0] // fetch never sends the fragment anyway
     return `${path}${path.includes('?') ? '&' : '?'}${search}`
+}
+
+// URLs with a scheme or starting with // ignore baseURL, as in axios
+const ABSOLUTE_URL = /^([a-z][a-z\d+\-.]*:)?\/\//i
+
+function withBase(url: string, baseURL?: string): string {
+    if (!baseURL || ABSOLUTE_URL.test(url)) return url
+    return url ? `${baseURL.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}` : baseURL
+}
+
+/** Later sources win per header name; a null or undefined value drops the header. */
+function mergeHeaders(...sources: (HeadersOption | undefined)[]): Headers {
+    const headers = new Headers()
+    const apply = (value: string | null | undefined, name: string) => {
+        if (value == null) headers.delete(name)
+        else headers.set(name, value)
+    }
+    for (const source of sources) {
+        if (source instanceof Headers || Array.isArray(source)) new Headers(source).forEach(apply)
+        else for (const [name, value] of Object.entries(source ?? {})) apply(value, name)
+    }
+    return headers
+}
+
+type Options = RequestOptions & ClientOptions
+type Merged = Options & { headers: Headers, hooks: Required<Hooks> }
+
+const mergeHooks = (a: Hooks = {}, b: Hooks = {}): Required<Hooks> => ({
+    onRequest: [...(a.onRequest ?? []), ...(b.onRequest ?? [])],
+    onResponse: [...(a.onResponse ?? []), ...(b.onResponse ?? [])],
+    onError: [...(a.onError ?? []), ...(b.onError ?? [])],
+})
+
+const merge = (defaults: ClientOptions, options: Options): Merged => ({
+    ...defaults,
+    ...options,
+    headers: mergeHeaders(defaults.headers, options.headers),
+    query: { ...defaults.query, ...options.query },
+    hooks: mergeHooks(defaults.hooks, options.hooks),
+})
+
+const RETRY_DEFAULTS = {
+    limit: 2,
+    methods: ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'],
+    statusCodes: [408, 429, 500, 502, 503, 504],
+    delay: (attempt: number) => 300 * 2 ** (attempt - 1),
+    maxRetryAfter: 60_000,
+}
+
+// A ReadableStream body can be read only once, so such a request is never retried
+function retryPolicy(retry: RequestOptions['retry'], method: string, body: unknown) {
+    if (!retry) return { ...RETRY_DEFAULTS, limit: 0 }
+    const { methods, ...policy } = { ...RETRY_DEFAULTS, ...(typeof retry === 'number' ? { limit: retry } : retry) }
+    const retryable = methods.some((each) => each.toUpperCase() === method) && !(body instanceof ReadableStream)
+    return { ...policy, limit: retryable ? policy.limit : 0 }
+}
+
+/** Milliseconds from a `Retry-After` of delay-seconds or an HTTP date, or undefined when absent or invalid. */
+function retryAfter(response: Response): number | undefined {
+    const value = response.headers.get('retry-after')
+    if (value === null) return undefined
+    const ms = /^\s*\d+\s*$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()
+    return Number.isNaN(ms) ? undefined : Math.max(0, ms)
+}
+
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((resolve, reject) => {
+        const onAbort = () => {
+            clearTimeout(timer)
+            reject(signal.reason)
+        }
+        // Remove the listener once done, so a long-lived signal does not collect them
+        const timer = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort)
+            resolve()
+        }, ms)
+        signal.addEventListener('abort', onAbort, { once: true })
+    })
+}
+
+/** Adds the XSRF header from its cookie, unless already set, the origin is not allowed or there is no document. */
+function addXsrf(headers: Headers, url: string, xsrf: boolean | XsrfOptions = false) {
+    if (!xsrf || typeof document === 'undefined') return
+    const { cookieName = 'XSRF-TOKEN', headerName = 'X-XSRF-TOKEN', origins = [] } = xsrf === true ? {} : xsrf
+    const allowed = [location.origin, ...origins.map((each) => new URL(each).origin)]
+    if (headers.has(headerName) || !allowed.includes(new URL(url, location.href).origin)) return
+
+    const cookie = document.cookie.split('; ').find((each) => each.startsWith(`${cookieName}=`))
+    if (!cookie) return
+    const value = cookie.slice(cookieName.length + 1)
+    // A malformed cookie is sent as it is, rather than failing every request
+    try {
+        headers.set(headerName, decodeURIComponent(value))
+    } catch {
+        headers.set(headerName, value)
+    }
 }
 
 // Longer delays overflow the timer, and the request aborts almost immediately
@@ -123,42 +317,108 @@ async function readBody(response: Response, responseType?: ResponseType): Promis
     }
 }
 
-async function request(method: string, url: string, options: RequestOptions = {}): Promise<any> {
-    const { query, body, timeout, responseType, ...init } = options
+async function request(method: string, url: string, options: Merged): Promise<any> {
+    const {
+        baseURL, query, queryArrayFormat, body, timeout, responseType, headers: headersOption, hooks, retry: retryOption, xsrf,
+        ...init
+    } = options
     const isJson = body != null && !isNativeBody(body)
+    const fullUrl = withQuery(withBase(url, baseURL), query, queryArrayFormat)
+    // Created once, so the timeout also covers the hooks, the waits and every retry
+    const signal = withTimeout(init.signal, timeout)
+    const policy = retryPolicy(retryOption, method, body)
+    const context = { method, url: fullUrl, headers: new Headers(), options }
 
-    const headers = new Headers(init.headers)
-    if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
-    if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
+    // Each attempt starts again from the merged URL and headers, and runs onRequest
+    const send = async (): Promise<Response> => {
+        for (let attempt = 1; ; attempt++) {
+            const headers = new Headers(headersOption)
+            if (!headers.has('accept')) headers.set('accept', DEFAULT_ACCEPT)
+            if (isJson && !headers.has('content-type')) headers.set('content-type', 'application/json')
+            context.url = fullUrl
+            context.headers = headers
+            for (const hook of hooks.onRequest) await hook(context)
+            // After the hooks, since one may point the URL at another origin
+            addXsrf(context.headers, context.url, xsrf)
 
-    const fullUrl = withQuery(url, query)
-    const response = await fetch(fullUrl, {
-        // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
-        ...(body instanceof ReadableStream && { duplex: 'half' }),
-        ...init,
-        method,
-        headers,
-        body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
-        signal: withTimeout(init.signal, timeout),
-    })
+            const canRetry = attempt <= policy.limit
+            let response: Response
+            try {
+                response = await fetch(context.url, {
+                    // fetch requires duplex: 'half' to stream a body, but RequestInit does not declare it
+                    ...(body instanceof ReadableStream && { duplex: 'half' }),
+                    ...init,
+                    method,
+                    headers: context.headers,
+                    body: isJson ? JSON.stringify(body) : (body as BodyInit | null | undefined),
+                    signal,
+                })
+            } catch (error) {
+                // fetch rejects with a TypeError when the network fails; aborts and timeouts are not retried
+                if (!canRetry || !(error instanceof TypeError)) throw error
+                await sleep(policy.delay(attempt), signal)
+                continue
+            }
+
+            if (!canRetry || !policy.statusCodes.includes(response.status)) return response
+            const after = retryAfter(response)
+            if (after !== undefined && after > policy.maxRetryAfter) return response
+            // Nothing else reads the discarded response, so free its connection. Cancelling a body
+            // that already failed rejects, which would otherwise be an unhandled rejection
+            /* v8 ignore next */
+            response.body?.cancel().catch(() => {})
+            await sleep(after ?? policy.delay(attempt), signal)
+        }
+    }
+
+    let retried = false
+    const retry = () => {
+        if (retried) return Promise.reject(new Error('retry() can only be called once per request'))
+        if (body instanceof ReadableStream) return Promise.reject(new TypeError('A ReadableStream body cannot be sent again'))
+        retried = true
+        return send()
+    }
+
+    // Other return values are ignored, so a JavaScript hook like `ok && retry()` returning false keeps the response
+    let response = await send()
+    for (const hook of hooks.onResponse) {
+        const next = await hook({ ...context, response, retry })
+        if (next instanceof Response) response = next
+    }
 
     if (!response.ok) {
         const data = parseLoose(await response.text(), response.headers.get('content-type'))
-        throw new HttpError(method, fullUrl, response, data)
+        const error = new HttpError(method, context.url, response, data)
+        let thrown: Error = error
+        for (const hook of hooks.onError) {
+            const next = await hook(error)
+            if (next instanceof Error) thrown = next
+        }
+        throw thrown
     }
     return readBody(response, responseType)
 }
 
-const withoutBody = <O extends BodyRequestOptions>(method: string): MethodWithoutBody<O> =>
-    (url: string, options?: O) => request(method, url, options)
+function client(defaults: ClientOptions): HttpClient {
+    const send = (method: string, url: string, options: Options = {}) => request(method, url, merge(defaults, options))
 
-const withBody = (method: string): MethodWithBody =>
-    (url: string, body?: unknown, options?: BodyRequestOptions) => request(method, url, { ...options, body })
+    const withoutBody = (method: string) =>
+        (url: string, options?: RequestOptions) => send(method, url, options)
 
-export const http = {
-    get: withoutBody<BodyRequestOptions>('GET'),
-    delete: withoutBody<RequestOptions>('DELETE'),
-    post: withBody('POST'),
-    put: withBody('PUT'),
-    patch: withBody('PATCH'),
+    const withBody = (method: string) =>
+        (url: string, body?: unknown, options?: BodyRequestOptions) => send(method, url, { ...options, body })
+
+    return {
+        get: withoutBody('GET'),
+        head: withoutBody('HEAD'),
+        options: withoutBody('OPTIONS'),
+        delete: withoutBody('DELETE'),
+        post: withBody('POST'),
+        put: withBody('PUT'),
+        patch: withBody('PATCH'),
+        create: (options = {}) => client(merge({}, options)),
+        extend: (options) => client(merge(defaults, options)),
+    }
 }
+
+export const http = client({})

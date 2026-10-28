@@ -1,14 +1,18 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
-import { HttpError, http } from '../src/index.js'
+import { afterAll, afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest'
+import { HttpError, http, type BodyRequestOptions, type ResponseType } from '../src/index.js'
 
 // A real local server instead of a mocked fetch:
-// /echo responds with the received method, url, headers and body
+// /echo, also under any prefix such as /api/echo, responds with the received method, url, headers and body
 // /reply?status=&type=&body= responds with the given status, Content-Type and body
 // /slow?ms=&stage= waits ms before sending the headers, or before finishing the body when stage=body
+// /auth responds 401 unless Authorization is "Bearer fresh", with the received body
+// /flaky?key=&fail=&status=&retryAfter= fails the first `fail` requests for each key, with `status`
+// or a dropped connection when status=drop, then responds with the attempt count, method and body
 let server: Server
 let base: string
+const attempts = new Map<string, number>()
 
 beforeAll(async () => {
     server = createServer(async (req, res) => {
@@ -16,7 +20,7 @@ beforeAll(async () => {
         const chunks: Buffer[] = []
         for await (const chunk of req) chunks.push(chunk as Buffer)
 
-        if (url.pathname === '/echo') {
+        if (url.pathname.endsWith('/echo')) {
             res.setHeader('content-type', 'application/json; charset=utf-8')
             res.end(JSON.stringify({
                 method: req.method,
@@ -24,6 +28,33 @@ beforeAll(async () => {
                 headers: req.headers,
                 body: Buffer.concat(chunks).toString(),
             }))
+            return
+        }
+
+        if (url.pathname === '/auth') {
+            const ok = req.headers.authorization === 'Bearer fresh'
+            res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ ok, body: Buffer.concat(chunks).toString() }))
+            return
+        }
+
+        if (url.pathname === '/flaky') {
+            const key = String(url.searchParams.get('key'))
+            const count = (attempts.get(key) ?? 0) + 1
+            attempts.set(key, count)
+            if (count <= Number(url.searchParams.get('fail'))) {
+                const status = url.searchParams.get('status')
+                if (status === 'drop') {
+                    req.socket.destroy()
+                    return
+                }
+                const retryAfter = url.searchParams.get('retryAfter')
+                res.writeHead(Number(status), retryAfter === null ? {} : { 'retry-after': retryAfter })
+                res.end('failed')
+                return
+            }
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify({ attempts: count, method: req.method, body: Buffer.concat(chunks).toString() }))
             return
         }
 
@@ -80,6 +111,16 @@ describe('HTTP methods', () => {
         expect(echo.body).toBe('')
     })
 
+    it('head returns undefined, and its headers through responseType response', async () => {
+        expect(await http.head(`${base}/echo`)).toBeUndefined()
+        const response = await http.head(`${base}/echo`, { responseType: 'response' })
+        expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8')
+    })
+
+    it('options sends an OPTIONS request', async () => {
+        expect((await http.options(`${base}/echo`)).method).toBe('OPTIONS')
+    })
+
     it('delete accepts a body through options.body', async () => {
         const echo = await http.delete(`${base}/echo`, { body: { ids: [1, 2] } })
         expect(JSON.parse(echo.body)).toEqual({ ids: [1, 2] })
@@ -132,6 +173,12 @@ describe('headers', () => {
         expect(echo.headers['x-token']).toBe('abc')
         expect(headers).toEqual({ 'Content-Type': 'application/vnd.api+json', Accept: 'text/html', 'X-Token': 'abc' })
     })
+
+    it('does not send headers set to null or undefined', async () => {
+        const echo = await http.get(`${base}/echo`, { headers: { 'X-A': null, 'X-B': undefined } })
+        expect(echo.headers['x-a']).toBeUndefined()
+        expect(echo.headers['x-b']).toBeUndefined()
+    })
 })
 
 describe('query', () => {
@@ -150,6 +197,27 @@ describe('query', () => {
 
     it('appends to an existing query string', async () => {
         expect(await urlOf('/echo?sort=name', { query: { page: 2 } })).toBe('/echo?sort=name&page=2')
+    })
+
+    it.each([
+        ['brackets', '/echo?ids[]=1&ids[]=2&page=1'],
+        ['repeat', '/echo?ids=1&ids=2&page=1'],
+        ['comma', '/echo?ids=1,2&page=1'],
+    ] as const)('queryArrayFormat %s', async (queryArrayFormat, expected) => {
+        expect(await urlOf('/echo', { query: { ids: [1, null, 2], page: 1 }, queryArrayFormat })).toBe(expected)
+    })
+
+    it('skips an empty or all-null array in every format', async () => {
+        for (const queryArrayFormat of ['brackets', 'repeat', 'comma'] as const) {
+            expect(await urlOf('/echo', { query: { a: [], b: [null], c: 'x' }, queryArrayFormat })).toBe('/echo?c=x')
+        }
+    })
+
+    it('takes queryArrayFormat as a client default, which a request can replace', async () => {
+        const api = http.create({ baseURL: base, queryArrayFormat: 'repeat' })
+        expect(decodeURIComponent((await api.get('/echo', { query: { ids: [1, 2] } })).url)).toBe('/echo?ids=1&ids=2')
+        expect(decodeURIComponent((await api.get('/echo', { query: { ids: [1, 2] }, queryArrayFormat: 'comma' })).url))
+            .toBe('/echo?ids=1,2')
     })
 })
 
@@ -187,7 +255,14 @@ describe('errors', () => {
         expect(error.statusText).toBe('Unprocessable Entity')
         expect(error.data).toEqual({ errors: { name: ['The name field is required.'] } })
         expect(error.response).toBeInstanceOf(Response)
-        expect(error.message).toMatch(/^HTTP 422 Unprocessable Entity: GET http:\/\/127\.0\.0\.1:\d+\/reply\?/)
+        // The query is left out of the message, since it may hold tokens
+        expect(error.message).toBe(`HTTP 422 Unprocessable Entity: GET ${base}/reply`)
+        expect(error.response.url).toContain('/reply?status=422')
+    })
+
+    it('leaves the query and fragment out of the message of any HttpError', () => {
+        const error = new HttpError('GET', '/users?token=secret#top', new Response(null, { status: 404 }), undefined)
+        expect(error.message).toBe('HTTP 404: GET /users')
     })
 
     it('keeps the raw text as data when an error body is malformed JSON', async () => {
@@ -293,6 +368,16 @@ describe('responseType', () => {
         expect(await response.json()).toEqual({ a: 1 })
     })
 
+    it('accepts a responseType only known at runtime, and options typed with the exported types', async () => {
+        const read = (responseType: ResponseType) => http.get(`${base}/reply`, { query: replying('text/plain', 'hi'), responseType })
+        expect(await read('text')).toBe('hi')
+        expect(await read('blob')).toBeInstanceOf(Blob)
+
+        const post = (options?: BodyRequestOptions) => http.post(`${base}/echo`, { a: 1 }, options)
+        expect((await post()).body).toBe('{"a":1}')
+        expect(typeof await post({ responseType: 'text' })).toBe('string')
+    })
+
     it('works on methods with a body', async () => {
         const text = await http.post(`${base}/echo`, { a: 1 }, { responseType: 'text' })
         expectTypeOf(text).toEqualTypeOf<string>()
@@ -306,5 +391,507 @@ describe('responseType', () => {
         }).catch((e) => e)
         expect(error).toBeInstanceOf(HttpError)
         expect(error.data).toEqual({ message: 'Not found' })
+    })
+})
+
+describe('create and extend', () => {
+    it.each([['/api', '/echo'], ['/api/', '/echo'], ['/api', 'echo'], ['/api//', 'echo']])(
+        'joins baseURL %s and %s with one slash',
+        async (prefix, path) => {
+            const api = http.create({ baseURL: `${base}${prefix}` })
+            expect((await api.get(path)).url).toBe('/api/echo')
+        },
+    )
+
+    it('uses baseURL alone for an empty path', async () => {
+        expect((await http.create({ baseURL: `${base}/api/echo` }).get('')).url).toBe('/api/echo')
+    })
+
+    it('uses absolute and protocol-relative URLs as-is', async () => {
+        const api = http.create({ baseURL: 'http://127.0.0.1:1/unused' })
+        expect((await api.get(`${base}/echo`)).url).toBe('/echo')
+        // Node.js has no page to resolve //host against, so fetch gets the URL unchanged and cannot parse it
+        const host = base.slice('http://'.length)
+        await expect(api.get(`//${host}/echo`)).rejects.toThrow(`Failed to parse URL from //${host}/echo`)
+    })
+
+    it('includes baseURL in the HttpError message', async () => {
+        const error = await http.create({ baseURL: base }).get('/reply', { query: { status: 404 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+        expect(error.message).toBe(`HTTP 404 Not Found: GET ${base}/reply`)
+    })
+
+    it('merges headers per name, and null or undefined drops a default', async () => {
+        const api = http.create({ headers: { Authorization: 'Bearer a', 'X-App': 'web', 'X-Env': 'prod' } })
+        const echo = await api.get(`${base}/echo`, {
+            headers: { authorization: 'Bearer b', 'X-App': null, 'X-Env': undefined, 'X-Call': '1' },
+        })
+        expect(echo.headers.authorization).toBe('Bearer b')
+        expect(echo.headers['x-app']).toBeUndefined()
+        expect(echo.headers['x-env']).toBeUndefined()
+        expect(echo.headers['x-call']).toBe('1')
+        expect(echo.headers.accept).toBe('application/json, text/plain, */*')
+    })
+
+    it('accepts Headers and arrays as default headers', async () => {
+        const api = http.create({ headers: new Headers({ 'X-A': '1', 'X-B': '2' }) }).extend({ headers: [['X-C', '3']] })
+        const echo = await api.get(`${base}/echo`, { headers: { 'X-A': null } })
+        expect(echo.headers['x-a']).toBeUndefined()
+        expect(echo.headers['x-b']).toBe('2')
+        expect(echo.headers['x-c']).toBe('3')
+    })
+
+    it('merges query per key, and null drops a default', async () => {
+        const api = http.create({ baseURL: base, query: { lang: 'zh', page: 1 } })
+        expect((await api.get('/echo')).url).toBe('/echo?lang=zh&page=1')
+        expect((await api.get('/echo', { query: { page: 2, lang: null, q: 'x' } })).url).toBe('/echo?page=2&q=x')
+    })
+
+    it('applies a default timeout, which a request can turn off', async () => {
+        const api = http.create({ baseURL: base, timeout: 50 })
+        expect((await api.get('/slow', { query: { ms: 500 } }).catch((e) => e)).name).toBe('TimeoutError')
+        expect(await api.get('/slow', { query: { ms: 100 }, timeout: undefined })).toBe('done')
+    })
+
+    it('extend inherits the defaults, create starts over, and neither changes the original', async () => {
+        const api = http.create({ baseURL: base, headers: { 'X-App': 'web' } })
+        const admin = api.extend({ baseURL: `${base}/admin`, headers: { 'X-Role': 'admin' } })
+
+        const echo = await admin.get('/echo')
+        expect(echo.url).toBe('/admin/echo')
+        expect(echo.headers['x-app']).toBe('web')
+        expect(echo.headers['x-role']).toBe('admin')
+
+        expect((await api.create({ baseURL: base }).get('/echo')).headers['x-app']).toBeUndefined()
+        expect((await api.get('/echo')).headers['x-role']).toBeUndefined()
+    })
+
+    it.each(['create', 'extend'] as const)('%s copies the defaults, so changing them later has no effect', async (method) => {
+        const defaults = { baseURL: base, headers: { 'X-A': '1' } as Record<string, string>, query: { a: 1 } }
+        const api = http[method](defaults)
+        defaults.baseURL = 'http://127.0.0.1:1'
+        defaults.headers['X-A'] = '2'
+        defaults.query.a = 2
+        const echo = await api.get('/echo')
+        expect(echo.headers['x-a']).toBe('1')
+        expect(echo.url).toBe('/echo?a=1')
+    })
+
+    it('keeps body handling and responseType inference', async () => {
+        const api = http.create({ baseURL: base })
+        const text = await api.post('/echo', { a: 1 }, { responseType: 'text' })
+        expectTypeOf(text).toEqualTypeOf<string>()
+        expect(JSON.parse(text).body).toBe('{"a":1}')
+    })
+
+    it('does not take body or responseType as defaults', () => {
+        // @ts-expect-error a default responseType would break the inferred return types
+        http.create({ responseType: 'text' })
+        // @ts-expect-error a body is given per request
+        http.create({ body: 'x' })
+    })
+})
+
+describe('hooks', () => {
+    it('onRequest runs before every request, so headers can follow the current token', async () => {
+        let token = 'a'
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [async ({ headers }) => {
+                    await new Promise((resolve) => setTimeout(resolve, 5))
+                    headers.set('authorization', `Bearer ${token}`)
+                }],
+            },
+        })
+        expect((await api.get('/echo')).headers.authorization).toBe('Bearer a')
+        token = 'b'
+        expect((await api.get('/echo')).headers.authorization).toBe('Bearer b')
+    })
+
+    it('onRequest gets the method, the full URL and the options, and can replace the URL', async () => {
+        const api = http.create({
+            baseURL: 'http://127.0.0.1:1',
+            hooks: {
+                onRequest: [(context) => {
+                    expect(context.method).toBe('POST')
+                    expect(context.url).toBe('http://127.0.0.1:1/users?page=2')
+                    expect(context.options.body).toEqual({ a: 1 })
+                    context.url = `${base}/echo?via=hook`
+                }],
+            },
+        })
+        const echo = await api.post('/users', { a: 1 }, { query: { page: 2 } })
+        expect(echo.url).toBe('/echo?via=hook')
+        expect(echo.body).toBe('{"a":1}')
+    })
+
+    it('an error thrown by a hook rejects the request', async () => {
+        const api = http.create({ hooks: { onRequest: [() => { throw new Error('blocked') }] } })
+        await expect(api.get(`${base}/echo`)).rejects.toThrow('blocked')
+    })
+
+    it('runs the parent client hooks, then the child client, then the request', async () => {
+        const calls: string[] = []
+        const hook = (name: string) => () => { calls.push(name) }
+        const api = http.create({ baseURL: base, hooks: { onRequest: [hook('parent')] } })
+            .extend({ hooks: { onRequest: [hook('child')] } })
+        await api.get('/echo', { hooks: { onRequest: [hook('request')] } })
+        expect(calls).toEqual(['parent', 'child', 'request'])
+
+        calls.length = 0
+        await http.get(`${base}/echo`, { hooks: { onRequest: [hook('plain')] } })
+        expect(calls).toEqual(['plain'])
+    })
+
+    it('onResponse sees every status before the body is read, and can replace the response', async () => {
+        const seen: number[] = []
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onResponse: [({ response }) => {
+                    seen.push(response.status)
+                    expect(response.bodyUsed).toBe(false)
+                    if (response.status === 404) {
+                        return new Response('{"fallback":true}', { headers: { 'content-type': 'application/json' } })
+                    }
+                }],
+            },
+        })
+        expect(await api.get('/reply', { query: { status: 404 } })).toEqual({ fallback: true })
+        expect(await api.get('/reply', { query: { status: 200, type: 'text/plain', body: 'ok' } })).toBe('ok')
+        expect(seen).toEqual([404, 200])
+    })
+
+    it('retry() sends the request again, body included, after onResponse refreshes the token', async () => {
+        let token = 'stale'
+        let refreshes = 0
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [({ headers }) => headers.set('authorization', `Bearer ${token}`)],
+                onResponse: [async ({ response, retry }) => {
+                    if (response.status !== 401) return
+                    refreshes++
+                    token = 'fresh'
+                    return retry()
+                }],
+            },
+        })
+        expect(await api.post('/auth', { a: 1 })).toEqual({ ok: true, body: '{"a":1}' })
+        expect(refreshes).toBe(1)
+    })
+
+    it('concurrent requests can share one token refresh, as the README shows', async () => {
+        let token = 'stale'
+        let refreshes = 0
+        let refreshing: Promise<void> | null = null
+        const refreshToken = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20))
+            refreshes++
+            token = 'fresh'
+        }
+        const refresh = () => (refreshing ??= refreshToken().finally(() => { refreshing = null }))
+
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onRequest: [({ headers }) => headers.set('Authorization', `Bearer ${token}`)],
+                onResponse: [async ({ response, headers, retry }) => {
+                    if (response.status !== 401) return
+                    // Refresh only if it used the current token; one sent with an older token just goes again
+                    if (headers.get('Authorization') === `Bearer ${token}`) await refresh()
+                    return retry()
+                }],
+            },
+        })
+        const results = await Promise.all([api.get('/auth'), api.get('/auth'), api.get('/auth')])
+        expect(results.map((result) => result.ok)).toEqual([true, true, true])
+        expect(refreshes).toBe(1)
+
+        // A later 401 is refreshed again
+        token = 'expired'
+        expect((await api.get('/auth')).ok).toBe(true)
+        expect(refreshes).toBe(2)
+    })
+
+    it('does not run onResponse again on the retried response', async () => {
+        let calls = 0
+        const api = http.create({ baseURL: base, hooks: { onResponse: [({ retry }) => { calls++; return retry() }] } })
+        const error = await api.get('/auth').catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+        expect(error.status).toBe(401)
+        expect(calls).toBe(1)
+    })
+
+    it('retry() can only be called once per request', async () => {
+        const api = http.create({ baseURL: base, hooks: { onResponse: [async ({ retry }) => { await retry(); return retry() }] } })
+        await expect(api.get('/echo')).rejects.toThrow('retry() can only be called once per request')
+    })
+
+    it('retry() rejects for a ReadableStream body, which cannot be sent again', async () => {
+        const api = http.create({ baseURL: base, hooks: { onResponse: [({ retry }) => retry()] } })
+        await expect(api.post('/echo', new Blob(['x']).stream())).rejects.toThrow('A ReadableStream body cannot be sent again')
+    })
+
+    it('the timeout also covers the hooks', async () => {
+        const api = http.create({
+            baseURL: base,
+            timeout: 50,
+            hooks: { onRequest: [() => new Promise((resolve) => setTimeout(resolve, 100))] },
+        })
+        expect((await api.get('/echo').catch((e) => e)).name).toBe('TimeoutError')
+    })
+
+    it('onError gets each HttpError, and the last error returned is thrown instead', async () => {
+        class AppError extends Error {}
+        const seen: unknown[] = []
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onError: [
+                    (error) => { seen.push(error) },
+                    (error) => new AppError(`app: ${error.status}`),
+                    (error) => { seen.push(error) },
+                ],
+            },
+        })
+        const error = await api.get('/reply', { query: { status: 500 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(AppError)
+        expect(error.message).toBe('app: 500')
+        expect(seen).toHaveLength(2)
+        for (const each of seen) expect(each).toBeInstanceOf(HttpError)
+    })
+
+    it('ignores hook return values that are not a Response or an Error, such as false from `ok && retry()`', async () => {
+        const api = http.create({
+            baseURL: base,
+            hooks: {
+                onResponse: [() => false as unknown as void],
+                onError: [() => 'not an error' as unknown as void],
+            },
+        })
+        expect((await api.get('/echo')).method).toBe('GET')
+        const error = await api.get('/reply', { query: { status: 500 } }).catch((e) => e)
+        expect(error).toBeInstanceOf(HttpError)
+    })
+
+    it('onError is not called for successful responses or network errors', async () => {
+        let calls = 0
+        const api = http.create({ hooks: { onError: [() => { calls++ }] } })
+        await api.get(`${base}/echo`)
+        await api.get('http://127.0.0.1:1/').catch(() => {})
+        expect(calls).toBe(0)
+    })
+})
+
+describe('retry', () => {
+    let keys = 0
+    // A new key per call, so each request has its own failure count on the server
+    const flaky = (fail: number, status: number | 'drop', extra: Record<string, string> = {}) =>
+        ({ key: `retry-${++keys}`, fail, status, ...extra })
+    const noWait = { delay: () => 0 }
+
+    it('is off by default', async () => {
+        const query = flaky(1, 503)
+        expect((await http.get(`${base}/flaky`, { query }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('retries a retryable status up to the limit, running onRequest on every attempt', async () => {
+        let sends = 0
+        const api = http.create({
+            baseURL: base,
+            timeout: 5000,
+            retry: { limit: 2, ...noWait },
+            hooks: { onRequest: [() => { sends++ }] },
+        })
+        expect(await api.get('/flaky', { query: flaky(2, 503) })).toMatchObject({ attempts: 3 })
+        expect(sends).toBe(3)
+    })
+
+    it('throws the last HttpError once the limit is used up, and onResponse sees only that response', async () => {
+        const seen: number[] = []
+        const api = http.create({
+            baseURL: base,
+            retry: { limit: 2, ...noWait },
+            hooks: { onResponse: [({ response }) => { seen.push(response.status) }] },
+        })
+        const query = flaky(3, 500)
+        expect((await api.get('/flaky', { query }).catch((e) => e)).status).toBe(500)
+        expect(attempts.get(query.key)).toBe(3)
+        expect(seen).toEqual([500])
+    })
+
+    it('a number sets the limit, with the default delay starting at 300ms', async () => {
+        const started = Date.now()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503), retry: 1 })).toMatchObject({ attempts: 2 })
+        expect(Date.now() - started).toBeGreaterThanOrEqual(290)
+    })
+
+    it('retries network errors', async () => {
+        expect(await http.get(`${base}/flaky`, { query: flaky(2, 'drop'), retry: noWait })).toMatchObject({ attempts: 3 })
+    })
+
+    it('does not retry other statuses, or errors thrown by hooks', async () => {
+        const query = flaky(1, 404)
+        expect((await http.get(`${base}/flaky`, { query, retry: noWait }).catch((e) => e)).status).toBe(404)
+        expect(attempts.get(query.key)).toBe(1)
+
+        let calls = 0
+        const buggy = () => {
+            calls++
+            throw new TypeError('bug in a hook')
+        }
+        await expect(http.get(`${base}/echo`, { retry: noWait, hooks: { onRequest: [buggy] } })).rejects.toThrow('bug in a hook')
+        expect(calls).toBe(1)
+    })
+
+    it('retries exactly the statuses listed in statusCodes, even one without a body', async () => {
+        for (const status of [404, 204]) {
+            const retry = { statusCodes: [status], ...noWait }
+            expect(await http.get(`${base}/flaky`, { query: flaky(1, status), retry })).toMatchObject({ attempts: 2 })
+        }
+        const query = flaky(1, 503)
+        expect((await http.get(`${base}/flaky`, { query, retry: { statusCodes: [404], ...noWait } }).catch((e) => e)).status).toBe(503)
+    })
+
+    it('retries POST and PATCH only when listed, sending the body again', async () => {
+        const query = flaky(1, 503)
+        expect((await http.post(`${base}/flaky`, { a: 1 }, { query, retry: noWait }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+
+        const retry = { methods: ['post'], ...noWait }
+        expect(await http.post(`${base}/flaky`, { a: 1 }, { query: flaky(1, 503), retry }))
+            .toEqual({ attempts: 2, method: 'POST', body: '{"a":1}' })
+    })
+
+    it('does not retry a ReadableStream body, which can be read only once', async () => {
+        const query = flaky(1, 503)
+        const error = await http.put(`${base}/flaky`, new Blob(['x']).stream(), { query, retry: noWait }).catch((e) => e)
+        expect(error.status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('waits for Retry-After in seconds instead of the delay', async () => {
+        const started = Date.now()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 429, { retryAfter: '1' }), retry: noWait }))
+            .toMatchObject({ attempts: 2 })
+        expect(Date.now() - started).toBeGreaterThanOrEqual(950)
+    })
+
+    it('reads Retry-After as an HTTP date too, and falls back to the delay when it is invalid', async () => {
+        // With this delay, the test would time out unless Retry-After is used
+        const slow = { delay: () => 60_000 }
+        const past = new Date(Date.now() - 1000).toUTCString()
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503, { retryAfter: past }), retry: slow }))
+            .toMatchObject({ attempts: 2 })
+        expect(await http.get(`${base}/flaky`, { query: flaky(1, 503, { retryAfter: 'soon' }), retry: noWait }))
+            .toMatchObject({ attempts: 2 })
+    })
+
+    it('does not wait for a Retry-After longer than maxRetryAfter', async () => {
+        const query = flaky(1, 429, { retryAfter: '120' })
+        expect((await http.get(`${base}/flaky`, { query, retry: noWait }).catch((e) => e)).status).toBe(429)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+
+    it('the timeout covers the waits, and an abort stops a wait', async () => {
+        const wait = { delay: () => 1000 }
+        const timedOut = await http.get(`${base}/flaky`, { query: flaky(1, 503), retry: wait, timeout: 100 }).catch((e) => e)
+        expect(timedOut.name).toBe('TimeoutError')
+
+        const controller = new AbortController()
+        setTimeout(() => controller.abort(), 50)
+        const aborted = await http.get(`${base}/flaky`, { query: flaky(1, 'drop'), retry: wait, signal: controller.signal }).catch((e) => e)
+        expect(aborted.name).toBe('AbortError')
+    })
+
+    it('retries HEAD and OPTIONS by default', async () => {
+        for (const method of ['head', 'options'] as const) {
+            const query = flaky(1, 503)
+            await http[method](`${base}/flaky`, { query, retry: noWait })
+            expect(attempts.get(query.key)).toBe(2)
+        }
+    })
+
+    it('does not retry an aborted request', async () => {
+        let sends = 0
+        const hooks = { onRequest: [() => { sends++ }] }
+        const error = await http.get(`${base}/echo`, { signal: AbortSignal.abort(), retry: noWait, hooks }).catch((e) => e)
+        expect(error.name).toBe('AbortError')
+        expect(sends).toBe(1)
+    })
+
+    it('a request can turn off the retry of its client', async () => {
+        const api = http.create({ baseURL: base, retry: noWait })
+        const query = flaky(1, 503)
+        expect((await api.get('/flaky', { query, retry: 0 }).catch((e) => e)).status).toBe(503)
+        expect(attempts.get(query.key)).toBe(1)
+    })
+})
+
+describe('xsrf', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals()
+    })
+
+    // Pretends to run in a browser page on `origin` that has these cookies
+    const page = (origin: string, cookie: string) => {
+        vi.stubGlobal('document', { cookie })
+        vi.stubGlobal('location', new URL(`${origin}/page`))
+    }
+    // Laravel URL-encodes the cookie value
+    const cookie = 'XSRF-TOKEN=eyJpdiI6IjEyMyJ9%3D'
+    const token = 'eyJpdiI6IjEyMyJ9='
+
+    it('is off by default', async () => {
+        page(base, cookie)
+        expect((await http.get(`${base}/echo`)).headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends the decoded cookie as X-XSRF-TOKEN on same-origin requests', async () => {
+        page(base, `other=1; ${cookie}; more=2`)
+        const api = http.create({ baseURL: base, xsrf: true })
+        expect((await api.get('/echo')).headers['x-xsrf-token']).toBe(token)
+        expect((await api.post('/echo', { a: 1 })).headers['x-xsrf-token']).toBe(token)
+    })
+
+    it('never sends it to another origin, even when an onRequest hook changes the URL', async () => {
+        page('http://example.com', cookie)
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+
+        // The request starts on the page's origin, and the hook moves it to another one
+        const echo = await http.get('http://example.com/api', {
+            xsrf: true,
+            hooks: { onRequest: [(context) => { context.url = `${base}/echo` }] },
+        })
+        expect(echo.headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends it to the listed origins too, such as an API on a subdomain', async () => {
+        page('http://app.example.com', cookie)
+        const echo = await http.get(`${base}/echo`, { xsrf: { origins: ['http://other.example.com', `${base}/`] } })
+        expect(echo.headers['x-xsrf-token']).toBe(token)
+    })
+
+    it('takes custom cookie and header names, and keeps a header set by hand', async () => {
+        page(base, 'csrf=abc')
+        const xsrf = { cookieName: 'csrf', headerName: 'X-CSRF-Token' }
+        expect((await http.get(`${base}/echo`, { xsrf })).headers['x-csrf-token']).toBe('abc')
+        const mine = await http.get(`${base}/echo`, { xsrf, headers: { 'X-CSRF-Token': 'mine' } })
+        expect(mine.headers['x-csrf-token']).toBe('mine')
+    })
+
+    it('sends nothing without the cookie, or outside a browser', async () => {
+        page(base, 'XSRF-TOKEN-OLD=1; other=2')
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+        vi.unstubAllGlobals()
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBeUndefined()
+    })
+
+    it('sends a malformed cookie as it is instead of failing the request', async () => {
+        page(base, 'XSRF-TOKEN=%E0%A4%A')
+        expect((await http.get(`${base}/echo`, { xsrf: true })).headers['x-xsrf-token']).toBe('%E0%A4%A')
     })
 })
